@@ -1,0 +1,189 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Map Scraper</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Manrope:wght@600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="sidepanel.css" />
+</head>
+<body class="ms-page">
+
+<div class="app-shell">
+  <main class="main-canvas">
+
+    <!-- ── HOME VIEW ── -->
+    <section id="homeScreen" class="home-screen">
+      <header class="workspace-hero">
+        <p class="hero-kicker">Map Scraper</p>
+        <h1 class="hero-title">Pull markers from any map.</h1>
+        <p class="hero-copy">Click a pin, review the fields, download your data.</p>
+      </header>
+
+      <div class="home-meta-row">
+        <span class="home-meta-label">Active target</span>
+      </div>
+
+      <div class="home-target-card">
+        <span class="home-target-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" class="icon-svg" aria-hidden="true">
+            <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"></path>
+            <circle cx="12" cy="10" r="3"></circle>
+          </svg>
+        </span>
+        <div>
+          <p id="homeTargetHost" class="home-target-host">No active tab</p>
+          <p id="homeTargetStatus" class="home-target-status">—</p>
+        </div>
+      </div>
+
+      <button id="homeStartBtn" class="btn btn-primary btn-lg btn-full">Start scraping this page</button>
+
+      <div id="homeSavedSection" class="home-saved-section" hidden>
+        <div class="home-meta-row">
+          <span class="home-meta-label">Saved sites</span>
+          <span id="homeSavedCount" class="home-saved-count">0</span>
+        </div>
+        <div id="homeSavedList" class="home-saved-list" role="list"></div>
+      </div>
+    </section>
+
+    <!-- ── DETAIL VIEW ── -->
+    <section id="detailView" class="detail-view hidden">
+      <div class="detail-nav-row">
+        <button id="backHomeBtn" class="btn btn-link btn-back-home" type="button">‹ Home</button>
+      </div>
+
+      <section class="detail-context-card">
+        <p class="detail-context-label" id="detailContextLabel">Target</p>
+        <p class="detail-context-copy" id="detailContextCopy">Current tab</p>
+      </section>
+
+      <!-- Step stack: 3 steps, linear -->
+      <div class="step-stack">
+
+        <!-- STEP 1: Capture -->
+        <section class="step in-progress open" data-step="capture" id="step-capture">
+          <button class="step-head" data-open="capture" type="button">
+            <div class="step-title-row">
+              <span class="step-index">1</span>
+              <span class="step-title-wrap">
+                <span class="step-title">Capture a pin</span>
+                <span class="step-description">Click any pin on the page.</span>
+              </span>
+            </div>
+            <span class="step-state" id="state-capture">To do</span>
+          </button>
+          <div class="step-body" id="body-capture">
+            <p class="hint">We'll learn the popup shape and detect the map library automatically.</p>
+            <button id="btnCapture" class="btn btn-primary btn-full">Capture a pin</button>
+            <div id="captureDetected" class="note"></div>
+            <div id="captureResult" class="note"></div>
+          </div>
+        </section>
+
+        <!-- STEP 2: Fields -->
+        <section class="step step-muted" data-step="fields" id="step-fields">
+          <button class="step-head" data-open="fields" type="button">
+            <div class="step-title-row">
+              <span class="step-index">2</span>
+              <span class="step-title-wrap">
+                <span class="step-title">Fields</span>
+                <span class="step-description">Review the data we'll collect.</span>
+              </span>
+            </div>
+            <span class="step-state" id="state-fields">To do</span>
+          </button>
+          <div class="step-body" id="body-fields">
+            <p class="hint">Each row is a column in your export. Edit, add, or remove as needed.</p>
+            <div id="schemaFields"></div>
+            <button id="btnAddField" class="btn btn-link">+ Add field</button>
+            <div class="btn-row btn-row-end">
+              <button id="btnFieldsNext" class="btn btn-primary">Next</button>
+            </div>
+          </div>
+        </section>
+
+        <!-- STEP 3: Run -->
+        <section class="step step-muted" data-step="run" id="step-run">
+          <button class="step-head" data-open="run" type="button">
+            <div class="step-title-row">
+              <span class="step-index">3</span>
+              <span class="step-title-wrap">
+                <span class="step-title">Run &amp; export</span>
+                <span class="step-description">Pull markers, review, download.</span>
+              </span>
+            </div>
+            <span class="step-state" id="state-run">To do</span>
+          </button>
+          <div class="step-body" id="body-run">
+            <label class="check-row">
+              <input type="checkbox" id="chkClusters" checked />
+              <span>Include markers inside clusters</span>
+            </label>
+
+            <div class="scrape-execution-card">
+              <div class="scrape-metric">
+                <div class="scrape-metric-row">
+                  <span class="scrape-metric-label">Markers extracted</span>
+                  <span class="scrape-metric-value" id="runCountText">0</span>
+                </div>
+                <div class="scrape-progress-track">
+                  <div class="scrape-progress-fill" id="runProgressFill"></div>
+                </div>
+              </div>
+              <p class="scrape-estimate" id="runEtaText">Ready to run on this page.</p>
+              <div class="btn-row scrape-start-row">
+                <button id="btnRun" class="btn btn-primary btn-full">Start collection</button>
+              </div>
+            </div>
+
+            <div id="livePreview" class="live-preview" hidden>
+              <div class="preview-head">
+                <p class="preview-count" id="previewCountLabel">Live preview</p>
+              </div>
+              <div class="table-wrap">
+                <table id="previewTable">
+                  <thead id="previewHead"></thead>
+                  <tbody id="previewBody"></tbody>
+                </table>
+              </div>
+            </div>
+
+            <div id="exportActions" class="scrape-export-section" hidden>
+              <p class="scrape-export-label">Export as</p>
+              <div class="btn-row">
+                <button id="btnExportCsv"  class="btn btn-default">CSV</button>
+                <button id="btnExportJson" class="btn btn-default">JSON</button>
+                <button id="btnCopyTsv"    class="btn btn-default" title="Copy tab-separated — pastes into Sheets/Excel">Copy</button>
+              </div>
+              <button id="btnSaveProfile" class="btn btn-link">Save profile for this site</button>
+            </div>
+
+            <!-- Advanced / diagnostic panel, only shows when auto-run had to fall back or fails -->
+            <details id="advancedPanel" class="advanced-panel" hidden>
+              <summary>Troubleshoot</summary>
+              <div class="advanced-body">
+                <p class="hint">If results don't look right, tell Map Scraper what to click.</p>
+                <div class="btn-row">
+                  <button id="btnPick"     class="btn btn-default">Pick a pin</button>
+                  <button id="btnPickList" class="btn btn-default">Pick a card/row</button>
+                </div>
+                <div id="pickResult" class="note"></div>
+                <div id="advancedEndpoints"></div>
+              </div>
+            </details>
+          </div>
+        </section>
+
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<script type="module" src="sidepanel.js"></script>
+</body>
+</html>

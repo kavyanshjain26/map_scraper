@@ -1,0 +1,62 @@
+{
+  "manifest_version": 3,
+  "name": "Map Marker Scraper",
+  "version": "1.3.0",
+  "description": "Scrape markers/pins from maps on any website (Leaflet, Mapbox, Google Maps, OpenLayers, or generic DOM / network fetch).",
+
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage",
+    "sidePanel",
+    "webRequest"
+  ],
+
+  "host_permissions": [
+    "<all_urls>"
+  ],
+
+  "background": {
+    "service_worker": "src/background/service-worker.js",
+    "type": "module"
+  },
+
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["src/content/content-script.js"],
+      "css": ["src/content/overlay.css"],
+      "run_at": "document_start",
+      "all_frames": false
+    }
+  ],
+
+  "side_panel": {
+    "default_path": "src/sidepanel/sidepanel.html"
+  },
+
+  "action": {
+    "default_title": "Map Marker Scraper",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "48": "icons/icon-48.png",
+      "128": "icons/icon-128.png"
+    }
+  },
+
+  "icons": {
+    "16": "icons/icon-16.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
+
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "src/injected/*.js",
+        "src/injected/adapters/*.js"
+      ],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}

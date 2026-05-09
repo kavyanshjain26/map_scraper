@@ -1,0 +1,14 @@
+/* src/content/overlay.css
+   Styles for teach-mode and pick-mode UI. */
+
+.__mms_highlight {
+  outline: 2px solid #ff3b30 !important;
+  outline-offset: 2px !important;
+  background: rgba(255, 59, 48, 0.08) !important;
+  cursor: crosshair !important;
+}
+
+body.__mms_picking,
+body.__mms_picking * {
+  cursor: crosshair !important;
+}
