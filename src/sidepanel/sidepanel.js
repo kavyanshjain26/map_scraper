@@ -2,8 +2,6 @@
 //
 // Unified workflow:
 //
-//   [Home] → Start scraping this page
-//   [Detail]:
 //     Step 1: Capture a pin
 //       - Runs silent detection first (figures out which map library is there).
 //       - Then enters capture mode. On the user's pin click we record three things:
@@ -21,8 +19,7 @@
 import { MSG }                          from "../shared/messages.js";
 import { toCSV, downloadBlob }          from "../shared/export.js";
 import { inferSchema }                  from "../shared/schema.js";
-import { loadProfile, saveProfile,
-         deleteProfile, listProfiles }  from "../shared/profiles.js";
+import { loadProfile, saveProfile }     from "../shared/profiles.js";
 import { networkFetchMarkers,
          pickBestMarkerEndpoint }       from "../shared/network-fetch.js";
 import { escapeHtml }                   from "../shared/html.js";
@@ -50,18 +47,6 @@ let detectedListCount    = 0;    // how many cards it matched
 let detectedMarkerCount  = null; // marker count after a successful library run
 
 // ── Navigation ───────────────────────────────────────────────────────
-
-function showHome() {
-  $("#homeScreen").classList.remove("hidden");
-  $("#detailView").classList.add("hidden");
-  refreshSavedList();
-}
-function showDetail() {
-  $("#homeScreen").classList.add("hidden");
-  $("#detailView").classList.remove("hidden");
-  $("#detailContextLabel").textContent = currentHost ? "Site" : "Target";
-  $("#detailContextCopy").textContent  = currentHost || "Current tab";
-}
 
 // ── Step wizard ──────────────────────────────────────────────────────
 
@@ -108,7 +93,8 @@ async function refreshCurrentTabContext() {
 async function loadCurrentTargetProfile() {
   await refreshCurrentTabContext();
 
-  $("#homeTargetHost").textContent = currentHost || "No active tab";
+  $("#detailContextLabel").textContent = currentHost ? "Active target" : "Target";
+  $("#detailContextCopy").textContent = currentHost || "No active tab";
 
   const p = currentUrl ? await loadProfile(currentUrl) : null;
   if (p) {
@@ -118,14 +104,14 @@ async function loadCurrentTargetProfile() {
     savedProfileMode = p.mode || null;
     candidateEndpoint = p.networkUrl || null;
     const fieldCount = p.schemaHint?.fields?.length || 0;
-    $("#homeTargetStatus").textContent = `${fieldCount} saved field${fieldCount === 1 ? "" : "s"}`;
+    $("#targetStatusPill").textContent = `${fieldCount} saved field${fieldCount === 1 ? "" : "s"}`;
   } else {
     detectedAdapter = null;
     schemaHint = null;
     teachSamples = [];
     savedProfileMode = null;
     candidateEndpoint = null;
-    $("#homeTargetStatus").textContent = currentUrl ? "Ready to scrape" : "—";
+    $("#targetStatusPill").textContent = currentUrl ? "Ready" : "No tab";
   }
 }
 async function sendToTab(type, payload) {
@@ -266,42 +252,6 @@ function renderPreview(markers) {
   ).join("");
 }
 
-async function refreshSavedList() {
-  const profiles = await listProfiles();
-  const section = $("#homeSavedSection");
-  const count   = $("#homeSavedCount");
-  const list    = $("#homeSavedList");
-  count.textContent = profiles.length;
-  if (profiles.length === 0) { section.hidden = true; return; }
-  section.hidden = false;
-  list.innerHTML = "";
-  for (const p of profiles) {
-    const host = (p.origin || "").replace(/^https?:\/\//, "").replace(/^www\./, "");
-    const fieldCount = p.schemaHint?.fields?.length || 0;
-    const item = document.createElement("div");
-    item.className = "home-saved-item";
-    item.dataset.origin = p.origin;
-
-    const textWrap = document.createElement("div");
-    const title = document.createElement("div");
-    title.className = "home-saved-title";
-    title.textContent = host;
-    const meta = document.createElement("div");
-    meta.className = "home-saved-meta";
-    meta.textContent = `${fieldCount} field${fieldCount === 1 ? "" : "s"}`;
-    textWrap.append(title, meta);
-
-    const del = document.createElement("button");
-    del.className = "home-saved-del";
-    del.dataset.origin = p.origin;
-    del.setAttribute("aria-label", "Delete profile");
-    del.textContent = "×";
-
-    item.append(textWrap, del);
-    list.appendChild(item);
-  }
-}
-
 function updateRunProgress(done, total) {
   const fill = $("#runProgressFill");
   const txt  = $("#runCountText");
@@ -320,51 +270,14 @@ function updateRunProgress(done, total) {
 
 async function bootstrap() {
   await loadCurrentTargetProfile();
-  await refreshSavedList();
-}
-bootstrap();
-
-// ── Home interactions ────────────────────────────────────────────────
-
-$("#homeStartBtn").addEventListener("click", async () => {
-  await loadCurrentTargetProfile();
-  showDetail();
   renderSchema(schemaHint);
-  // If we have a saved profile with fields, skip straight to Run.
-  // Otherwise start at Capture (which will trigger silent detection).
   if (schemaHint?.fields?.length) {
     advanceTo("run");
   } else {
     advanceTo("capture");
   }
-});
-
-$("#homeSavedList").addEventListener("click", async (ev) => {
-  const del = ev.target.closest(".home-saved-del");
-  if (del) {
-    await deleteProfile(del.dataset.origin);
-    await refreshSavedList();
-    ev.stopPropagation();
-    return;
-  }
-  const item = ev.target.closest(".home-saved-item");
-  if (!item) return;
-  const origin = item.dataset.origin;
-  if (currentUrl && new URL(currentUrl).origin === origin) {
-    const p = await loadProfile(origin);
-    if (p) {
-      detectedAdapter = p.adapter;
-      schemaHint      = p.schemaHint || null;
-      candidateEndpoint = p.networkUrl || null;
-      savedProfileMode = p.mode || null;
-      $("#homeStartBtn").click();
-    }
-  } else {
-    showToast(`Open ${origin.replace(/^https?:\/\//, "")} in this tab first`);
-  }
-});
-
-$("#backHomeBtn").addEventListener("click", showHome);
+}
+bootstrap();
 
 // ── Step heads: click to expand ──────────────────────────────────────
 
@@ -812,6 +725,7 @@ $("#btnSaveProfile").addEventListener("click", async () => {
     schemaHint,
     networkUrl: candidateEndpoint || null,
   });
+  const fieldCount = schemaHint?.fields?.length || 0;
+  $("#targetStatusPill").textContent = `${fieldCount} saved field${fieldCount === 1 ? "" : "s"}`;
   showToast("Profile saved");
-  refreshSavedList();
 });
