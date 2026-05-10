@@ -5,6 +5,7 @@
 
 import { BaseAdapter } from "./base-adapter.js";
 import { asCoords } from "../../shared/network-fetch.js";
+import { recoverFromGlobals } from "../recover.js";
 
 const DECK_INSTANCES = (window.__MMS_DECK_INSTANCES__ ||= []);
 
@@ -108,7 +109,31 @@ export class DeckAdapter extends BaseAdapter {
         instances: instances.map((deck) => ({ kind: "live", deck })),
       };
     }
-    return { confidence: 0.25, reason: "deck.gl present, hook missed construction", instances: [] };
+
+    // Hook missed construction. deck.gl Deck instances have a distinctive
+    // shape (setProps + props.layers + a canvas/animationLoop). Walk
+    // window.* to find them.
+    const recovered = recoverFromGlobals(isDeckInstance);
+    if (recovered.length > 0) {
+      for (const deck of recovered) {
+        if (!DECK_INSTANCES.includes(deck)) {
+          try { registerDeckInstance(deck, deck.props || {}); } catch (_) {}
+        }
+      }
+      return {
+        confidence: 0.8,
+        reason: `recovered ${recovered.length} Deck instance(s) from page state`,
+        instances: recovered.map((deck) => ({ kind: "live", deck })),
+      };
+    }
+
+    // Last resort: still report the library so the side panel doesn't fall
+    // back to "generic". The enumerator will explain why a reload is needed.
+    return {
+      confidence: 0.5,
+      reason: "deck.gl present, hook missed construction — reload page for full extraction",
+      instances: [{ kind: "dom-only" }],
+    };
   }
 
   get rendersToCanvas() { return true; }
@@ -158,6 +183,18 @@ export class DeckAdapter extends BaseAdapter {
     }
     return out;
   }
+}
+
+function isDeckInstance(o) {
+  if (!o || typeof o !== "object") return false;
+  const Deck = window.deck?.Deck || window.Deck;
+  if (Deck) {
+    try { if (o instanceof Deck) return true; } catch (_) { /* fall through */ }
+  }
+  // Duck-type: a Deck instance has setProps, finalize, and a props bag.
+  return typeof o.setProps === "function"
+      && typeof o.finalize === "function"
+      && o.props && typeof o.props === "object";
 }
 
 function getLayerSnapshots(deck) {

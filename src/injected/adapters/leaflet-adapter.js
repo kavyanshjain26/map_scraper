@@ -24,6 +24,7 @@
 
 import { BaseAdapter } from "./base-adapter.js";
 import { applySchemaFields } from "../../shared/schema-selectors.js";
+import { recoverFromGlobals, recoverFromContainer } from "../recover.js";
 
 // Array of every L.Map instance we've seen, populated by the init hook.
 // Global on the page world — one per page load.
@@ -63,16 +64,12 @@ export class LeafletAdapter extends BaseAdapter {
 
   async detect() {
     const hookedInstances = INSTANCES.slice();
-
-    // Even if the hook missed the construction, the DOM is a strong signal.
     const containers = Array.from(document.querySelectorAll(".leaflet-container"));
 
     if (hookedInstances.length === 0 && containers.length === 0) {
       return { confidence: 0, reason: "no leaflet instances or containers", instances: [] };
     }
 
-    // Prefer hooked instances (we have full library access). Fall back to
-    // container elements — the enumerator will do what it can with DOM.
     if (hookedInstances.length > 0) {
       return {
         confidence: 0.95,
@@ -81,9 +78,21 @@ export class LeafletAdapter extends BaseAdapter {
       };
     }
 
+    // Hook missed construction. Try to dig the live L.Map out of the page
+    // — sites very often stash it on window.map or in a namespace.
+    const recovered = recoverLeafletMaps(containers);
+    if (recovered.length > 0) {
+      for (const m of recovered) if (!INSTANCES.includes(m)) INSTANCES.push(m);
+      return {
+        confidence: 0.85,
+        reason: `recovered ${recovered.length} L.Map instance(s) from page state`,
+        instances: recovered.map(m => ({ kind: "live", map: m })),
+      };
+    }
+
     return {
       confidence: 0.7,
-      reason: `${containers.length} .leaflet-container(s), hook missed construction`,
+      reason: `${containers.length} .leaflet-container(s), hook missed construction — reload page for full extraction`,
       instances: containers.map(el => ({ kind: "dom-only", el })),
     };
   }
@@ -146,6 +155,36 @@ export class LeafletAdapter extends BaseAdapter {
 }
 
 // ---------- internals ----------
+
+// Live L.Map shape check. Prefer instanceof when window.L is available;
+// fall back to duck-typing for sites that bundle Leaflet without exposing
+// the global.
+function isLeafletMap(o) {
+  if (!o || typeof o !== "object") return false;
+  const L = window.L;
+  if (L?.Map) {
+    try { if (o instanceof L.Map) return true; } catch (_) { /* fall through */ }
+  }
+  return typeof o.eachLayer === "function"
+      && typeof o.getCenter === "function"
+      && typeof o.getBounds === "function"
+      && typeof o.getZoom === "function";
+}
+
+function recoverLeafletMaps(containers) {
+  const found = new Set();
+  for (const m of recoverFromGlobals(isLeafletMap)) found.add(m);
+  for (const el of containers) {
+    const m = recoverFromContainer(el, isLeafletMap);
+    if (m) found.add(m);
+  }
+  // Filter to maps whose container is on this page.
+  const containerSet = new Set(containers);
+  return Array.from(found).filter((m) => {
+    try { return !m._container || containerSet.has(m._container); }
+    catch { return true; }
+  });
+}
 
 // Wait for the map to settle. Leaflet emits a flurry of events; "moveend"
 // and "load" cover both pan and tile-load. Falls back to a timeout.

@@ -22,6 +22,7 @@
 //     `features` property with the original leaves. Walk through.
 
 import { BaseAdapter } from "./base-adapter.js";
+import { recoverFromGlobals, recoverFromContainer } from "../recover.js";
 
 const INSTANCES = (window.__MMS_OL_INSTANCES__ ||= []);
 
@@ -56,9 +57,9 @@ export class OpenLayersAdapter extends BaseAdapter {
 
   async detect() {
     const hooked = INSTANCES.slice();
-    const viewports = document.querySelectorAll(".ol-viewport");
+    const viewportEls = Array.from(document.querySelectorAll(".ol-viewport"));
 
-    if (hooked.length === 0 && viewports.length === 0) {
+    if (hooked.length === 0 && viewportEls.length === 0) {
       return { confidence: 0, reason: "no .ol-viewport or ol global", instances: [] };
     }
     if (hooked.length > 0) {
@@ -68,10 +69,25 @@ export class OpenLayersAdapter extends BaseAdapter {
         instances: hooked.map(m => ({ kind: "live", map: m })),
       };
     }
+
+    // Bundled OL apps don't expose window.ol so the constructor hook can
+    // never fire. Try to recover the live Map by walking globals + the
+    // viewport's own internal state — bundled OL still attaches the Map
+    // object to its viewport's properties.
+    const recovered = recoverOLMaps(viewportEls);
+    if (recovered.length > 0) {
+      for (const m of recovered) if (!INSTANCES.includes(m)) INSTANCES.push(m);
+      return {
+        confidence: 0.85,
+        reason: `recovered ${recovered.length} ol.Map instance(s) from page state`,
+        instances: recovered.map((map) => ({ kind: "live", map })),
+      };
+    }
+
     return {
-      confidence: 0.4,
-      reason: `${viewports.length} .ol-viewport(s), bundled OL — can't hook`,
-      instances: Array.from(viewports).map(el => ({ kind: "dom-only", el })),
+      confidence: 0.5,
+      reason: `${viewportEls.length} .ol-viewport(s), bundled OL — reload page for full extraction`,
+      instances: viewportEls.map(el => ({ kind: "dom-only", el })),
     };
   }
 
@@ -149,4 +165,35 @@ export class OpenLayersAdapter extends BaseAdapter {
     }
     return out;
   }
+}
+
+
+// Shape-check for a live ol.Map instance.
+function isOLMap(o) {
+  if (!o || typeof o !== "object") return false;
+  const ol = window.ol;
+  if (ol?.Map) {
+    try { if (o instanceof ol.Map) return true; } catch (_) { /* fall through */ }
+  }
+  return typeof o.getView === "function"
+      && typeof o.getLayers === "function"
+      && typeof o.getViewport === "function";
+}
+
+function recoverOLMaps(viewports) {
+  const found = new Set();
+  for (const m of recoverFromGlobals(isOLMap)) found.add(m);
+  for (const el of viewports) {
+    // The viewport el itself is .ol-viewport; the Map is on its parent.
+    const recovered = recoverFromContainer(el.parentElement || el, isOLMap);
+    if (recovered) found.add(recovered);
+  }
+  // Filter to maps whose viewport is on this page.
+  const viewportSet = new Set(viewports);
+  return Array.from(found).filter((m) => {
+    try {
+      const vp = m.getViewport?.();
+      return !vp || viewportSet.has(vp);
+    } catch { return true; }
+  });
 }

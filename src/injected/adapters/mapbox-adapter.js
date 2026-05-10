@@ -5,6 +5,7 @@
 
 import { BaseAdapter } from "./base-adapter.js";
 import { applySchemaFields } from "../../shared/schema-selectors.js";
+import { recoverFromGlobals, recoverFromContainer } from "../recover.js";
 
 const MAP_INSTANCES = (window.__MMS_MAPBOX_INSTANCES__ ||= []);
 const MARKER_INSTANCES = (window.__MMS_MAPBOX_MARKER_INSTANCES__ ||= []);
@@ -84,10 +85,30 @@ export class MapboxAdapter extends BaseAdapter {
         instances: hooked.map((map) => ({ kind: "live", map })),
       };
     }
+
+    // Hook missed construction. Try to dig the live Map out of window.* /
+    // the .mapboxgl-map container's internal state. Sites stash their map
+    // on window.map, window.app.map, etc. quite often.
+    const containerEls = Array.from(domHits);
+    const recovered = recoverMapboxMaps(containerEls);
+    if (recovered.length > 0) {
+      for (const m of recovered) {
+        if (!MAP_INSTANCES.includes(m)) {
+          MAP_INSTANCES.push(m);
+          try { hookMapInstance(m); } catch (_) {}
+        }
+      }
+      return {
+        confidence: 0.85,
+        reason: `recovered ${recovered.length} Mapbox/MapLibre Map(s) from page state`,
+        instances: recovered.map((map) => ({ kind: "live", map })),
+      };
+    }
+
     return {
       confidence: 0.5,
-      reason: `DOM signals only (${domHits.length})`,
-      instances: Array.from(domHits).map((el) => ({ kind: "dom-only", el })),
+      reason: `DOM signals only (${domHits.length}) — reload page for full extraction`,
+      instances: containerEls.map((el) => ({ kind: "dom-only", el })),
     };
   }
 
@@ -184,6 +205,36 @@ export class MapboxAdapter extends BaseAdapter {
 
 function applySchema(rootEl, schemaHint) {
   return applySchemaFields(rootEl, schemaHint);
+}
+
+// Shape-check for a live Mapbox-GL / MapLibre-GL Map instance.
+function isMapboxMap(o) {
+  if (!o || typeof o !== "object") return false;
+  const gl = window.mapboxgl || window.maplibregl;
+  if (gl?.Map) {
+    try { if (o instanceof gl.Map) return true; } catch (_) { /* fall through */ }
+  }
+  return typeof o.getStyle === "function"
+      && typeof o.queryRenderedFeatures === "function"
+      && typeof o.getCenter === "function"
+      && typeof o.getZoom === "function";
+}
+
+function recoverMapboxMaps(containers) {
+  const found = new Set();
+  for (const m of recoverFromGlobals(isMapboxMap)) found.add(m);
+  for (const el of containers) {
+    const m = recoverFromContainer(el, isMapboxMap);
+    if (m) found.add(m);
+  }
+  // Filter to maps whose container is present on this page.
+  const containerSet = new Set(containers);
+  return Array.from(found).filter((m) => {
+    try {
+      const c = m.getContainer?.();
+      return !c || containerSet.has(c);
+    } catch { return true; }
+  });
 }
 
 async function readGeoJsonFeatures(map, sourceId, source, sourceDef, { expandClusters = true, queryTiles = true } = {}) {
