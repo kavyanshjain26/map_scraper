@@ -8,9 +8,12 @@ export const MSG = Object.freeze({
   // sidepanel -> service worker -> content script
   DETECT_MAPS:       "DETECT_MAPS",
   ENUMERATE_MARKERS: "ENUMERATE_MARKERS",
+  FIND_DATA_SOURCES: "FIND_DATA_SOURCES",
   START_TEACH:       "START_TEACH",       // enter "click a sample pin" mode
   STOP_TEACH:        "STOP_TEACH",
   CANCEL:            "CANCEL",
+  TEACH_CAPTURE_STARTED: "TEACH_CAPTURE_STARTED",
+  TEACH_CAPTURE_STOPPED: "TEACH_CAPTURE_STOPPED",
 
   // content script -> service worker -> sidepanel (progress / results)
   DETECTION_RESULT:   "DETECTION_RESULT",

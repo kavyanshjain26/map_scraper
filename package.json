@@ -1,0 +1,10 @@
+{
+  "name": "map-scraper",
+  "version": "1.4.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node tests/run.js",
+    "check:syntax": "powershell -NoProfile -ExecutionPolicy Bypass -File tests/check-syntax.ps1"
+  }
+}

@@ -11,6 +11,7 @@
 // of each match.
 
 import { BaseAdapter } from "./base-adapter.js";
+import { applySchemaFields } from "../../shared/schema-selectors.js";
 
 const DETECTED = (window.__MMS_LIST_DETECTED__ ||= { count: 0, selector: null });
 
@@ -96,12 +97,7 @@ export class ListAdapter extends BaseAdapter {
     if (!el) return out;
 
     if (schemaHint?.fields?.length) {
-      for (const f of schemaHint.fields) {
-        try {
-          const found = el.querySelector(f.selector);
-          if (found) out[f.key] = (found.textContent || "").trim();
-        } catch (_) { /* invalid selector */ }
-      }
+      Object.assign(out, applySchemaFields(el, schemaHint));
     } else {
       // No schema — grab the whole card's text as one blob.
       out.text = (el.textContent || "").replace(/\s+/g, " ").trim().slice(0, 500);

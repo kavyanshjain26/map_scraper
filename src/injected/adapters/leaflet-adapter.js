@@ -23,6 +23,7 @@
 // less complete but workable.
 
 import { BaseAdapter } from "./base-adapter.js";
+import { applySchemaFields } from "../../shared/schema-selectors.js";
 
 // Array of every L.Map instance we've seen, populated by the init hook.
 // Global on the page world — one per page load.
@@ -147,6 +148,7 @@ function enumerateFromLiveMap(map, { expandClusters }) {
   const results = [];
   const seen = new WeakSet();
   let idCounter = 0;
+  const L = window.L;
 
   const visit = (layer) => {
     if (!layer || seen.has(layer)) return;
@@ -168,8 +170,10 @@ function enumerateFromLiveMap(map, { expandClusters }) {
       return;
     }
 
-    // Actual marker: has getLatLng().
-    if (typeof layer.getLatLng === "function") {
+    // Actual marker: prefer Leaflet's class signal when available, then
+    // fall back to the getLatLng surface used by custom marker-like layers.
+    const isMarker = L?.Marker ? layer instanceof L.Marker : typeof layer.getLatLng === "function";
+    if (isMarker && typeof layer.getLatLng === "function") {
       const ll = layer.getLatLng();
       if (ll && Number.isFinite(ll.lat) && Number.isFinite(ll.lng)) {
         results.push({
@@ -185,7 +189,11 @@ function enumerateFromLiveMap(map, { expandClusters }) {
     // GeoJSON layers, heatmaps, tile layers — ignore.
   };
 
-  map.eachLayer(visit);
+  if (map._layers && typeof map._layers === "object") {
+    Object.values(map._layers).forEach(visit);
+  } else {
+    map.eachLayer(visit);
+  }
   return results;
 }
 
@@ -212,10 +220,5 @@ function applySchemaHint(html, schemaHint) {
   // schemaHint shape (from the teach flow):
   //   { fields: [ { key: "name", selector: "h3" }, { key: "address", selector: ".addr" } ] }
   const doc = new DOMParser().parseFromString(html, "text/html");
-  const out = {};
-  for (const f of schemaHint.fields || []) {
-    const el = doc.querySelector(f.selector);
-    if (el) out[f.key] = (el.textContent || "").trim();
-  }
-  return out;
+  return applySchemaFields(doc, schemaHint);
 }

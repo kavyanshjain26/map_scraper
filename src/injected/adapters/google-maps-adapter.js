@@ -25,6 +25,7 @@
 // party site that uses Google Maps to display its OWN data is usually fine.
 
 import { BaseAdapter } from "./base-adapter.js";
+import { applySchemaFields } from "../../shared/schema-selectors.js";
 
 const MAP_INSTANCES    = (window.__MMS_GOOGLE_INSTANCES__        ||= []);
 const MARKER_INSTANCES = (window.__MMS_GOOGLE_MARKER_INSTANCES__ ||= []);
@@ -238,10 +239,5 @@ async function openInfoWindow(marker, kind, timeoutMs = 1000) {
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 function applySchema(rootEl, schemaHint) {
-  const out = {};
-  for (const f of schemaHint.fields || []) {
-    const el = rootEl.querySelector(f.selector);
-    if (el) out[f.key] = (el.textContent || "").trim();
-  }
-  return out;
+  return applySchemaFields(rootEl, schemaHint);
 }

@@ -23,7 +23,11 @@ import { toCSV, downloadBlob }          from "../shared/export.js";
 import { inferSchema }                  from "../shared/schema.js";
 import { loadProfile, saveProfile,
          deleteProfile, listProfiles }  from "../shared/profiles.js";
-import { networkFetchMarkers }          from "../shared/network-fetch.js";
+import { networkFetchMarkers,
+         pickBestMarkerEndpoint }       from "../shared/network-fetch.js";
+import { escapeHtml }                   from "../shared/html.js";
+import { chooseDetectedLibrary,
+         shouldTryListFirst }           from "./strategy.js";
 
 const $  = (sel) => document.querySelector(sel);
 const $$ = (sel) => Array.from(document.querySelectorAll(sel));
@@ -39,10 +43,11 @@ let currentTabId       = null;
 let currentHost        = null;
 let recentEndpoints    = [];     // XHR/fetch URLs captured during Capture
 let candidateEndpoint  = null;   // best-guess JSON endpoint (auto-chosen)
+let teachSamples       = [];
 let savedProfileMode   = null;   // "library" | "network" from loaded profile
 let detectedListSelector = null; // auto-detected repeating card selector
 let detectedListCount    = 0;    // how many cards it matched
-let detectedMarkerCount  = 0;    // map markers (if library mode detected)
+let detectedMarkerCount  = null; // marker count after a successful library run
 
 // ── Navigation ───────────────────────────────────────────────────────
 
@@ -93,15 +98,42 @@ async function getActiveTab() {
   const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
   return tab || null;
 }
+async function refreshCurrentTabContext() {
+  const tab = await getActiveTab();
+  currentTabId = tab?.id || null;
+  currentUrl   = tab?.url || null;
+  currentHost  = currentUrl ? new URL(currentUrl).hostname.replace(/^www\./, "") : null;
+  return tab;
+}
+async function loadCurrentTargetProfile() {
+  await refreshCurrentTabContext();
+
+  $("#homeTargetHost").textContent = currentHost || "No active tab";
+
+  const p = currentUrl ? await loadProfile(currentUrl) : null;
+  if (p) {
+    detectedAdapter = p.adapter || null;
+    schemaHint = p.schemaHint || null;
+    teachSamples = [];
+    savedProfileMode = p.mode || null;
+    candidateEndpoint = p.networkUrl || null;
+    const fieldCount = p.schemaHint?.fields?.length || 0;
+    $("#homeTargetStatus").textContent = `${fieldCount} saved field${fieldCount === 1 ? "" : "s"}`;
+  } else {
+    detectedAdapter = null;
+    schemaHint = null;
+    teachSamples = [];
+    savedProfileMode = null;
+    candidateEndpoint = null;
+    $("#homeTargetStatus").textContent = currentUrl ? "Ready to scrape" : "—";
+  }
+}
 async function sendToTab(type, payload) {
   const tab = await getActiveTab();
   if (!tab) throw new Error("No active tab");
   const reply = await chrome.tabs.sendMessage(tab.id, { type, payload });
   if (!reply?.ok) throw new Error(reply?.error || `${type} failed`);
   return reply.result;
-}
-function escapeHtml(s) {
-  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 function showToast(text) {
   const t = document.createElement("div");
@@ -124,18 +156,16 @@ async function runDetection() {
   try {
     const results = await sendToTab(MSG.DETECT_MAPS);
 
-    // Pick best map-library winner (ignore List adapter for "library" slot)
-    const libs = results.filter(r => r.adapter !== "List (cards/rows)" && r.adapter !== "DOM (generic)");
-    const winner = libs.find(r => r.confidence > 0 && r.instanceCount > 0)
-                || libs.find(r => r.confidence > 0.1);
+    // Pick best map-library winner that has at least one usable instance.
+    const winner = chooseDetectedLibrary(results);
     if (winner) {
       detectedAdapter     = winner.adapter;
       detectedInstances   = winner.instanceCount;
-      detectedMarkerCount = winner.instanceCount;
+      detectedMarkerCount = null;
     } else {
       detectedAdapter     = null;
       detectedInstances   = 0;
-      detectedMarkerCount = 0;
+      detectedMarkerCount = null;
     }
 
     // Separately, check the List adapter's detection result
@@ -158,7 +188,7 @@ async function runDetection() {
   } catch (e) {
     detectedAdapter = null;
     detectedInstances = 0;
-    detectedMarkerCount = 0;
+    detectedMarkerCount = null;
     detectedListCount = 0;
     detectedListSelector = null;
     return null;
@@ -168,24 +198,7 @@ async function runDetection() {
 // ── Endpoint heuristic: pick the most marker-looking URL ─────────────
 
 function pickBestEndpoint(requests) {
-  if (!requests?.length) return null;
-  // Score by URL hints + preference for JSON-ish paths.
-  const score = (url) => {
-    let s = 0;
-    const u = url.toLowerCase();
-    if (/\.json(\b|$|\?)/.test(u))   s += 3;
-    if (/\/api\//.test(u))            s += 2;
-    if (/store|location|marker|pin|shop|branch|dealer|office/.test(u)) s += 4;
-    if (/search|query|list|nearby/.test(u)) s += 2;
-    if (/map/.test(u))                s += 1;
-    if (/tile|sprite|style|\.png|\.jpg|\.webp|\.svg/.test(u)) s -= 5;
-    if (/google|mapbox|maplibre/.test(u)) s -= 2;  // usually tiles, not data
-    return s;
-  };
-  const ranked = requests.map(r => ({ ...r, score: score(r.url) }))
-                         .filter(r => r.score > 0)
-                         .sort((a, b) => b.score - a.score);
-  return ranked[0]?.url || null;
+  return pickBestMarkerEndpoint(requests);
 }
 
 // ── Renderers ────────────────────────────────────────────────────────
@@ -204,10 +217,28 @@ function renderSchema(hint) {
   for (const [i, f] of fields.entries()) {
     const row = document.createElement("div");
     row.className = "field-row";
-    row.innerHTML = `
-      <input type="text" value="${escapeHtml(f.key)}"      data-idx="${i}" data-what="key" placeholder="key">
-      <input type="text" value="${escapeHtml(f.selector)}" data-idx="${i}" data-what="selector" placeholder="selector">
-      <button data-idx="${i}" data-what="delete" title="Remove">×</button>`;
+
+    const keyInput = document.createElement("input");
+    keyInput.type = "text";
+    keyInput.value = f.key || "";
+    keyInput.dataset.idx = String(i);
+    keyInput.dataset.what = "key";
+    keyInput.placeholder = "key";
+
+    const selectorInput = document.createElement("input");
+    selectorInput.type = "text";
+    selectorInput.value = f.selector || "";
+    selectorInput.dataset.idx = String(i);
+    selectorInput.dataset.what = "selector";
+    selectorInput.placeholder = "selector";
+
+    const deleteButton = document.createElement("button");
+    deleteButton.dataset.idx = String(i);
+    deleteButton.dataset.what = "delete";
+    deleteButton.title = "Remove";
+    deleteButton.textContent = "×";
+
+    row.append(keyInput, selectorInput, deleteButton);
     box.appendChild(row);
   }
 }
@@ -250,12 +281,23 @@ async function refreshSavedList() {
     const item = document.createElement("div");
     item.className = "home-saved-item";
     item.dataset.origin = p.origin;
-    item.innerHTML = `
-      <div>
-        <div class="home-saved-title">${escapeHtml(host)}</div>
-        <div class="home-saved-meta">${fieldCount} field${fieldCount === 1 ? "" : "s"}</div>
-      </div>
-      <button class="home-saved-del" data-origin="${escapeHtml(p.origin)}" aria-label="Delete profile">×</button>`;
+
+    const textWrap = document.createElement("div");
+    const title = document.createElement("div");
+    title.className = "home-saved-title";
+    title.textContent = host;
+    const meta = document.createElement("div");
+    meta.className = "home-saved-meta";
+    meta.textContent = `${fieldCount} field${fieldCount === 1 ? "" : "s"}`;
+    textWrap.append(title, meta);
+
+    const del = document.createElement("button");
+    del.className = "home-saved-del";
+    del.dataset.origin = p.origin;
+    del.setAttribute("aria-label", "Delete profile");
+    del.textContent = "×";
+
+    item.append(textWrap, del);
     list.appendChild(item);
   }
 }
@@ -277,24 +319,7 @@ function updateRunProgress(done, total) {
 // ── Bootstrap / profile load ─────────────────────────────────────────
 
 async function bootstrap() {
-  const tab = await getActiveTab();
-  currentTabId = tab?.id || null;
-  currentUrl   = tab?.url || null;
-  currentHost  = currentUrl ? new URL(currentUrl).hostname.replace(/^www\./, "") : null;
-
-  $("#homeTargetHost").textContent = currentHost || "No active tab";
-
-  const p = currentUrl ? await loadProfile(currentUrl) : null;
-  if (p) {
-    detectedAdapter  = p.adapter || null;
-    schemaHint       = p.schemaHint || null;
-    savedProfileMode = p.mode || null;
-    if (p.networkUrl) candidateEndpoint = p.networkUrl;
-    const fieldCount = p.schemaHint?.fields?.length || 0;
-    $("#homeTargetStatus").textContent = `${fieldCount} saved field${fieldCount === 1 ? "" : "s"}`;
-  } else {
-    $("#homeTargetStatus").textContent = currentUrl ? "Ready to scrape" : "—";
-  }
+  await loadCurrentTargetProfile();
   await refreshSavedList();
 }
 bootstrap();
@@ -302,6 +327,7 @@ bootstrap();
 // ── Home interactions ────────────────────────────────────────────────
 
 $("#homeStartBtn").addEventListener("click", async () => {
+  await loadCurrentTargetProfile();
   showDetail();
   renderSchema(schemaHint);
   // If we have a saved profile with fields, skip straight to Run.
@@ -377,15 +403,12 @@ $("#btnCapture").addEventListener("click", async () => {
     $("#captureDetected").textContent = "Found: " + bits.join(" + ") + ".";
   }
 
-  // 2. Arm both capture modes on the page at once:
-  //    START_TEACH   → records the popup HTML + recent network requests
-  //    START_PICK    → derives a pin-element selector for DOM fallback
-  // The content script's click handlers fire on the same user click and
-  // emit two separate events back to us (TEACH_SAMPLE_CAPTURED, PICK_COMPLETE).
+  // 2. Arm non-blocking capture. The content script records the clicked
+  // element's selector without cancelling the click, so the page can still
+  // open the popup for schema inference.
   btn.textContent = "Click a pin on the page…";
   try {
     await sendToTab("START_TEACH");
-    await sendToTab("START_PICK");
   } catch (e) {
     $("#captureResult").textContent = "Error arming capture: " + e.message;
     btn.disabled = false;
@@ -401,7 +424,12 @@ chrome.runtime.onMessage.addListener((msg) => {
     const p = msg.payload;
     // Schema from popup HTML
     if (p.popupHTML) {
-      schemaHint = inferSchema(p.popupHTML);
+      teachSamples.push(p.popupHTML);
+      schemaHint = mergeSchemas(teachSamples.map((html) => inferSchema(html)));
+      renderSchema(schemaHint);
+    }
+    if (p.markerSelector) {
+      schemaHint = { ...(schemaHint || {}), fields: schemaHint?.fields || [], markerSelector: p.markerSelector };
       renderSchema(schemaHint);
     }
     // Capture recent network requests for the auto-strategy Run
@@ -418,6 +446,7 @@ chrome.runtime.onMessage.addListener((msg) => {
     const bits = [];
     bits.push(detectedAdapter ? `Library: ${humanAdapter(detectedAdapter)}` : "Library: generic");
     bits.push(schemaHint?.fields?.length ? `Fields found: ${schemaHint.fields.length}` : "No popup fields found");
+    if (p.markerSelector) bits.push(`Pin selector: ${p.markerCount || 0} matches`);
     $("#captureResult").textContent = bits.join(" · ");
 
     $("#btnCapture").disabled = false;
@@ -445,11 +474,6 @@ chrome.runtime.onMessage.addListener((msg) => {
       detectedListSelector = p.selector;
       const pickResult = $("#pickResult");
       if (pickResult) pickResult.textContent = `List selector: ${p.selector}  (${p.count} cards)`;
-      // Re-run schema inference using the FIRST matching card as the popup.
-      const firstCard = document.querySelector(p.selector);
-      // (We can't access the page's DOM from the sidepanel — so we ask
-      // the content script to send us the first card's HTML via teach.)
-      void firstCard;
       showToast(`${p.count} cards detected`);
     }
     return;
@@ -465,6 +489,22 @@ chrome.runtime.onMessage.addListener((msg) => {
     return;
   }
 });
+
+function mergeSchemas(schemas) {
+  const fields = [];
+  const seenKeys = new Set();
+  const seenSelectors = new Set();
+  for (const schema of schemas) {
+    for (const field of schema?.fields || []) {
+      if (!field.key || !field.selector) continue;
+      if (seenKeys.has(field.key) || seenSelectors.has(field.selector)) continue;
+      seenKeys.add(field.key);
+      seenSelectors.add(field.selector);
+      fields.push(field);
+    }
+  }
+  return { ...(schemaHint || {}), fields };
+}
 
 // ── Step 2: Fields ───────────────────────────────────────────────────
 
@@ -508,13 +548,51 @@ $("#btnFieldsNext").addEventListener("click", () => {
 async function runAutoStrategy() {
   const attempts = [];
 
+  await refreshCurrentTabContext();
   if (!detectedAdapter) await runDetection();
 
-  // Strategy 1: List mode (sidebar/cards) — promoted if it's taught AND
-  // either we have no library OR list count > map marker count.
-  // We prefer list when it looks comprehensive.
+  // Strategy 1: page-exposed data arrays. This is fastest when the site
+  // already keeps all locations in a window-level store.
+  try {
+    updateRunProgress(0, 0);
+    $("#runEtaText").textContent = "Looking for page data…";
+    const result = await sendToTab(MSG.FIND_DATA_SOURCES, { limit: 5000 });
+    attempts.push({ name: "Page data source", count: result.count, ok: result.count > 0, source: result.source });
+    if (result.count > 0) {
+      lastMarkers = result.markers;
+      renderPreview(lastMarkers);
+      updateRunProgress(lastMarkers.length, lastMarkers.length);
+      return { strategy: "page-data", markers: lastMarkers, attempts };
+    }
+  } catch (e) {
+    attempts.push({ name: "Page data source", error: e.message, ok: false });
+  }
+
+  // Strategy 2: captured/fetched JSON endpoints.
+  const endpoint = candidateEndpoint || pickBestEndpoint(recentEndpoints) || (savedProfileMode === "network" ? candidateEndpoint : null);
+  if (endpoint && currentTabId) {
+    try {
+      $("#runEtaText").textContent = "Trying API endpoint…";
+      updateRunProgress(0, 0);
+      const markers = await networkFetchMarkers(currentTabId, endpoint);
+      attempts.push({ name: "API endpoint", endpoint, count: markers.length, ok: markers.length > 0 });
+      if (markers.length > 0) {
+        lastMarkers = markers;
+        candidateEndpoint = endpoint;
+        renderPreview(lastMarkers);
+        updateRunProgress(markers.length, markers.length);
+        return { strategy: "network", markers, attempts };
+      }
+    } catch (e) {
+      attempts.push({ name: "API endpoint", endpoint, error: e.message, ok: false });
+    }
+  }
+
+  // Strategy 3: List mode (sidebar/cards), but only before library mode
+  // when no usable library was detected. Library marker count is unknown
+  // until enumeration finishes, so list count cannot be compared up front.
   const hasListTeaching = !!schemaHint?.listSelector;
-  const tryListFirst = hasListTeaching && (!detectedAdapter || detectedListCount > (detectedMarkerCount || 0));
+  const tryListFirst = shouldTryListFirst({ hasListTeaching, detectedAdapter });
 
   if (tryListFirst) {
     try {
@@ -538,7 +616,7 @@ async function runAutoStrategy() {
     }
   }
 
-  // Strategy 2: Library mode
+  // Strategy 4: Library mode
   if (detectedAdapter) {
     try {
       updateRunProgress(0, 0);
@@ -550,38 +628,38 @@ async function runAutoStrategy() {
         instanceIndex: 0,
         expandClusters: $("#chkClusters").checked,
         schemaHint,
+        mode: "library",
       });
       attempts.push({ name: `Map library (${detectedAdapter})`, count: result.count, ok: result.count > 0 });
       if (result.count > 0) {
         lastMarkers = result.markers;
+        detectedMarkerCount = result.count;
         renderPreview(lastMarkers);
         return { strategy: "library", markers: lastMarkers, attempts };
+      }
+      if (detectedAdapter === "Mapbox GL") {
+        $("#runEtaText").textContent = "Panning map grid...";
+        const panResult = await sendToTab(MSG.ENUMERATE_MARKERS, {
+          adapterName: detectedAdapter,
+          instanceIndex: 0,
+          expandClusters: $("#chkClusters").checked,
+          schemaHint,
+          mode: "pan",
+        });
+        attempts.push({ name: "Mapbox pan grid", count: panResult.count, ok: panResult.count > 0 });
+        if (panResult.count > 0) {
+          lastMarkers = panResult.markers;
+          detectedMarkerCount = panResult.count;
+          renderPreview(lastMarkers);
+          return { strategy: "pan", markers: lastMarkers, attempts };
+        }
       }
     } catch (e) {
       attempts.push({ name: `Map library (${detectedAdapter})`, error: e.message, ok: false });
     }
   }
 
-  // Strategy 3: Network mode
-  const endpoint = candidateEndpoint || (savedProfileMode === "network" ? candidateEndpoint : null);
-  if (endpoint && currentTabId) {
-    try {
-      $("#runEtaText").textContent = "Trying API endpoint…";
-      updateRunProgress(0, 0);
-      const markers = await networkFetchMarkers(currentTabId, endpoint);
-      attempts.push({ name: "API endpoint", endpoint, count: markers.length, ok: markers.length > 0 });
-      if (markers.length > 0) {
-        lastMarkers = markers;
-        renderPreview(lastMarkers);
-        updateRunProgress(markers.length, markers.length);
-        return { strategy: "network", markers, attempts };
-      }
-    } catch (e) {
-      attempts.push({ name: "API endpoint", endpoint, error: e.message, ok: false });
-    }
-  }
-
-  // Strategy 4: List mode (if we didn't try it first)
+  // Strategy 5: List mode (if we didn't try it first)
   if (hasListTeaching && !tryListFirst) {
     try {
       updateRunProgress(0, 0);
@@ -604,7 +682,7 @@ async function runAutoStrategy() {
     }
   }
 
-  // Strategy 5: DOM-click fallback
+  // Strategy 6: DOM-click fallback
   if (schemaHint?.markerSelector) {
     try {
       $("#runEtaText").textContent = "Trying DOM click…";
@@ -614,8 +692,9 @@ async function runAutoStrategy() {
       const result = await sendToTab(MSG.ENUMERATE_MARKERS, {
         adapterName: "DOM (generic)",
         instanceIndex: 0,
-        expandClusters: false,
+        expandClusters: $("#chkClusters").checked,
         schemaHint,
+        mode: $("#chkClusters").checked ? "zoom" : "dom",
       });
       attempts.push({ name: "DOM click", count: result.count, ok: result.count > 0 });
       if (result.count > 0) {
@@ -714,6 +793,7 @@ $("#btnCopyTsv").addEventListener("click", async () => {
 });
 
 $("#btnSaveProfile").addEventListener("click", async () => {
+  await refreshCurrentTabContext();
   if (!currentUrl) return;
   // We still store "mode" for backwards compat with older profiles, but
   // the UI never shows it.

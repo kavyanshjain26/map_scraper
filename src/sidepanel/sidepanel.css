@@ -1,6 +1,6 @@
 /* src/sidepanel/sidepanel.css
    Visual language adapted from the uploaded Location Scraper sidebar:
-   Inter + Manrope typography, indigo accent (#3525cd), warm off-white
+   system typography, indigo accent (#3525cd), warm off-white
    app shell with a subtle radial gradient, rounded translucent cards,
    long-offset soft shadows, step wizard pattern. */
 
@@ -35,8 +35,8 @@
   --shadow-lift:   0 10px 20px -18px rgba(53, 37, 205, 0.52);
   --shadow-strong: 0 18px 36px -28px rgba(25, 28, 30, 0.45);
 
-  --font-body: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', sans-serif;
-  --font-head: 'Manrope', 'Inter', system-ui, -apple-system, sans-serif;
+  --font-body: system-ui, -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', sans-serif;
+  --font-head: system-ui, -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', sans-serif;
   --font-mono: ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas, monospace;
 }
 
@@ -54,7 +54,7 @@ html, body {
   -moz-osx-font-smoothing: grayscale;
 }
 
-h1, h2, h3, h4 { margin: 0; font-family: var(--font-head); font-weight: 800; letter-spacing: -0.02em; color: var(--ink); }
+h1, h2, h3, h4 { margin: 0; font-family: var(--font-head); font-weight: 800; letter-spacing: 0; color: var(--ink); }
 p { margin: 0; }
 
 .hidden { display: none !important; }

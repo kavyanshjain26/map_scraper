@@ -13,6 +13,10 @@
 (() => {
   const TO_PAGE   = "MMS_TO_PAGE";
   const FROM_PAGE = "MMS_FROM_PAGE";
+  const BRIDGE_TOKEN = crypto.randomUUID
+    ? crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const heuristicsReady = import(chrome.runtime.getURL("src/content/capture-heuristics.js"));
 
   // --- 1. Inject page-world script -----------------------------------------
   function inject() {
@@ -22,7 +26,9 @@
     const s = document.createElement("script");
     s.id = "__mms_page_script__";
     s.type = "module";
-    s.src = chrome.runtime.getURL("src/injected/page-script.js");
+    s.src = `${chrome.runtime.getURL("src/injected/page-script.js")}?token=${encodeURIComponent(BRIDGE_TOKEN)}`;
+    s.addEventListener("load", () => s.remove(), { once: true });
+    s.addEventListener("error", () => s.remove(), { once: true });
     // Appending to <html> works even before <head> exists at document_start.
     (document.head || document.documentElement).appendChild(s);
   }
@@ -37,27 +43,36 @@
   function sendToPage(cmd, payload) {
     return new Promise((resolve, reject) => {
       const id = nextId++;
-      pending.set(id, { resolve, reject });
-      window.postMessage({ source: TO_PAGE, id, cmd, payload }, "*");
+      const entry = { cmd, resolve, reject, timer: null };
+      entry.refreshTimeout = () => {
+        clearTimeout(entry.timer);
+        const timeoutMs = cmd === "ENUMERATE" ? 120_000 : 30_000;
+        entry.timer = setTimeout(() => {
+          if (pending.has(id)) {
+            pending.delete(id);
+            reject(new Error(`page-script timeout for cmd=${cmd}`));
+          }
+        }, timeoutMs);
+      };
+      entry.refreshTimeout();
+      pending.set(id, entry);
+      window.postMessage({ source: TO_PAGE, token: BRIDGE_TOKEN, id, cmd, payload }, "*");
       // Timeout guard — a dead page script shouldn't hang the sidepanel.
-      setTimeout(() => {
-        if (pending.has(id)) {
-          pending.delete(id);
-          reject(new Error(`page-script timeout for cmd=${cmd}`));
-        }
-      }, 30_000);
     });
   }
 
   window.addEventListener("message", (ev) => {
     if (ev.source !== window) return;
     const d = ev.data;
-    if (!d || d.source !== FROM_PAGE) return;
+    if (!d || d.source !== FROM_PAGE || d.token !== BRIDGE_TOKEN) return;
 
     // Progress events come with id: -1 and a progress payload. Forward
     // both the progress numbers AND the optional chunk of newly-extracted
     // markers so the sidepanel can render a live preview.
     if (d.id === -1 && d.progress) {
+      for (const entry of pending.values()) {
+        if (entry.cmd === "ENUMERATE") entry.refreshTimeout();
+      }
       chrome.runtime.sendMessage({
         type: "ENUMERATION_PROGRESS",
         payload: d.progress,
@@ -70,6 +85,7 @@
     const entry = pending.get(d.id);
     if (!entry) return;
     pending.delete(d.id);
+    clearTimeout(entry.timer);
     if (d.ok) entry.resolve(d.result);
     else      entry.reject(new Error(d.error || "page-script error"));
   });
@@ -89,8 +105,13 @@
             sendResponse({ ok: true, result });
             break;
           }
+          case "FIND_DATA_SOURCES": {
+            const result = await sendToPage("FIND_DATA_SOURCES", msg.payload);
+            sendResponse({ ok: true, result });
+            break;
+          }
           case "START_TEACH": {
-            startTeach();
+            await startTeach();
             sendResponse({ ok: true });
             break;
           }
@@ -141,7 +162,7 @@
   });
 
   // --- 3. Teach flow (sample-pin capture) ----------------------------------
-  // Records: DOM mutations within ~2s of a user click on the map area.
+  // Records DOM mutations within ~2s of a user click on the map area.
   // For each newly-added element we also capture its outerHTML and
   // visible text — we ship the single largest addition back as the
   // popup's best-guess HTML so the sidepanel can run schema inference
@@ -152,12 +173,18 @@
   let teachClickHandler = null;
   let teachObserver = null;
 
-  function startTeach() {
+  async function startTeach() {
     if (teachActive) return;
+    const heuristics = await heuristicsReady;
     teachActive = true;
+    await chrome.runtime.sendMessage({ type: "TEACH_CAPTURE_STARTED" }).catch(() => {});
 
     teachClickHandler = (ev) => {
+      document.removeEventListener("click", teachClickHandler, true);
+      teachClickHandler = null;
       const target = ev.target;
+      const markerSelector = heuristics.deriveMarkerSelector(target);
+      const markerCount = markerSelector ? document.querySelectorAll(markerSelector).length : 0;
       const clickInfo = {
         tag: target.tagName,
         cls: typeof target.className === "string" ? target.className : "",
@@ -165,42 +192,93 @@
         time: Date.now(),
       };
 
-      // Collect mutations for 2 seconds.
-      const additions = [];      // { path, outerHTML, textLen }
+      const mutations = [];
+      const candidateMap = new Map();
+      const rememberCandidate = (node, details = {}) => {
+        if (!node || node.nodeType !== 1) return;
+        const text = (node.textContent || "").trim();
+        if (text.length < 3) return;
+        const previous = candidateMap.get(node) || {
+          path: domPath(node),
+          outerHTML: "",
+          text: "",
+          textLen: 0,
+          becameVisible: false,
+          wasEmptyBefore: false,
+          reasons: new Set(),
+        };
+        previous.outerHTML = node.outerHTML || "";
+        previous.text = text;
+        previous.textLen = text.length;
+        previous.becameVisible ||= Boolean(details.becameVisible);
+        previous.wasEmptyBefore ||= Boolean(details.wasEmptyBefore);
+        if (details.reason) previous.reasons.add(details.reason);
+        candidateMap.set(node, previous);
+      };
       teachObserver = new MutationObserver((muts) => {
         for (const m of muts) {
-          for (const node of m.addedNodes) {
-            if (node.nodeType !== 1) continue;
-            // Skip trivial additions (empty divs, whitespace wrappers).
-            const text = (node.textContent || "").trim();
-            if (text.length < 3) continue;
-            additions.push({
-              path: domPath(node),
-              outerHTML: node.outerHTML,
-              textLen: text.length,
+          mutations.push({
+            type: m.type,
+            path: domPath(m.target?.nodeType === 1 ? m.target : m.target?.parentElement),
+            attributeName: m.attributeName || null,
+          });
+
+          if (m.type === "childList") {
+            for (const node of m.addedNodes) {
+              if (node.nodeType === 1) {
+                rememberCandidate(node, {
+                  reason: "added",
+                  becameVisible: heuristics.isVisible(node),
+                  wasEmptyBefore: true,
+                });
+              }
+            }
+          } else if (m.type === "attributes") {
+            rememberCandidate(m.target, {
+              reason: `attribute:${m.attributeName}`,
+              becameVisible: heuristics.isVisible(m.target),
+              wasEmptyBefore: (m.oldValue || "").length === 0,
+            });
+          } else if (m.type === "characterData") {
+            rememberCandidate(m.target.parentElement, {
+              reason: "text",
+              becameVisible: heuristics.isVisible(m.target.parentElement),
+              wasEmptyBefore: (m.oldValue || "").trim().length === 0,
             });
           }
         }
       });
-      teachObserver.observe(document.body, { childList: true, subtree: true });
+      teachObserver.observe(document.body, {
+        attributes: true,
+        attributeOldValue: true,
+        characterData: true,
+        characterDataOldValue: true,
+        childList: true,
+        subtree: true,
+      });
 
       setTimeout(() => {
         teachObserver?.disconnect();
         teachObserver = null;
 
         // Pick the addition with the most text — most likely the popup.
-        let best = null;
-        for (const a of additions) {
-          if (!best || a.textLen > best.textLen) best = a;
-        }
+        const candidates = Array.from(candidateMap.values()).map((candidate) => ({
+          ...candidate,
+          reasons: Array.from(candidate.reasons),
+        }));
+        const best = heuristics.choosePopupCandidate(candidates);
 
         chrome.runtime.sendMessage({
           type: "TEACH_SAMPLE_CAPTURED",
           payload: {
             click: clickInfo,
-            additions: additions.map(a => ({ path: a.path, textLen: a.textLen })),
+            additions: candidates.map(a => ({ path: a.path, textLen: a.textLen })),
+            mutations,
+            popupCandidates: candidates,
             popupHTML: best?.outerHTML || null,
             popupPath: best?.path || null,
+            markerSelector,
+            markerCount,
           },
         }).catch(() => {});
         stopTeach();
@@ -219,6 +297,7 @@
     teachObserver?.disconnect();
     teachObserver = null;
     teachActive = false;
+    chrome.runtime.sendMessage({ type: "TEACH_CAPTURE_STOPPED" }).catch(() => {});
   }
 
   function domPath(el) {
@@ -263,12 +342,13 @@
       }
     };
 
-    pickClickHandler = (ev) => {
+    pickClickHandler = async (ev) => {
       ev.preventDefault();
       ev.stopPropagation();
       const el = ev.target;
       if (!el) return;
 
+      const { deriveMarkerSelector } = await heuristicsReady;
       const selector = deriveMarkerSelector(el);
       const count = selector ? document.querySelectorAll(selector).length : 0;
 
@@ -294,55 +374,6 @@
     }
     document.body.classList.remove("__mms_picking");
     pickActive = false;
-  }
-
-  // Given a clicked element, try a series of selector generalizations
-  // and pick the one that returns the most hits (with a sanity ceiling
-  // so we don't match "every div on the page").
-  function deriveMarkerSelector(target) {
-    const MAX_HITS = 2000;     // over this, selector is too broad
-    const MIN_HITS = 1;        // under this, useless
-    const candidates = [];
-
-    // 1. Try the target's own classes, one at a time.
-    if (target.classList?.length) {
-      for (const cls of target.classList) {
-        candidates.push(`.${cssEscape(cls)}`);
-      }
-      // All classes combined.
-      candidates.push(
-        target.tagName.toLowerCase() +
-        Array.from(target.classList).map(c => "." + cssEscape(c)).join("")
-      );
-    }
-
-    // 2. Tag alone (weak but useful for <img>, <button>).
-    candidates.push(target.tagName.toLowerCase());
-
-    // 3. Walk up: parent's class + target's tag.
-    let parent = target.parentElement;
-    let steps = 0;
-    while (parent && steps < 3) {
-      if (parent.classList?.length) {
-        for (const cls of parent.classList) {
-          candidates.push(`.${cssEscape(cls)} > ${target.tagName.toLowerCase()}`);
-          candidates.push(`.${cssEscape(cls)} ${target.tagName.toLowerCase()}`);
-        }
-      }
-      parent = parent.parentElement;
-      steps++;
-    }
-
-    // Score each candidate: hits it returns, penalized if it exceeds
-    // the cap or is too generic. We want the most hits within bounds.
-    let best = null;
-    for (const sel of candidates) {
-      let count = 0;
-      try { count = document.querySelectorAll(sel).length; } catch { continue; }
-      if (count < MIN_HITS || count > MAX_HITS) continue;
-      if (!best || count > best.count) best = { sel, count };
-    }
-    return best?.sel || null;
   }
 
   function cssEscape(s) {

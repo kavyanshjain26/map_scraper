@@ -37,16 +37,34 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     chrome.runtime.sendMessage(msg).catch(() => {});
     return false;
   }
+
+  if (msg?.type === MSG.TEACH_CAPTURE_STARTED) {
+    if (sender.tab?.id !== undefined) {
+      TEACH_TABS.add(sender.tab.id);
+      RECENT.set(sender.tab.id, []);
+    }
+    return false;
+  }
+
+  if (msg?.type === MSG.TEACH_CAPTURE_STOPPED) {
+    if (sender.tab?.id !== undefined) {
+      TEACH_TABS.delete(sender.tab.id);
+    }
+    return false;
+  }
 });
 
 // 3b. Simple webRequest buffer, keyed by tab id. The sidepanel can ask for
 //     recent requests when a teach sample lands. We only keep the last N
 //     per tab to bound memory.
 const RECENT = new Map();   // tabId -> [{url, method, type, ts}]
+const TEACH_TABS = new Set();
 const MAX_PER_TAB = 200;
 
 chrome.webRequest.onBeforeRequest.addListener(
   (details) => {
+    if (details.tabId < 0 || !TEACH_TABS.has(details.tabId)) return;
+    if (details.type !== "xmlhttprequest" && details.type !== "fetch") return;
     const list = RECENT.get(details.tabId) || [];
     list.push({
       url: details.url,
@@ -60,7 +78,10 @@ chrome.webRequest.onBeforeRequest.addListener(
   { urls: ["<all_urls>"] }
 );
 
-chrome.tabs.onRemoved.addListener((tabId) => RECENT.delete(tabId));
+chrome.tabs.onRemoved.addListener((tabId) => {
+  RECENT.delete(tabId);
+  TEACH_TABS.delete(tabId);
+});
 
 // Expose the buffer to the sidepanel.
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {

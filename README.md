@@ -1,164 +1,107 @@
-# Map Marker Scraper (v1.0)
+# Map Marker Scraper (v1.4.0)
 
-A Chrome (MV3) extension that scrapes markers / pins from maps on any
-website. Supports Leaflet, Mapbox GL / MapLibre, Google Maps, and
-OpenLayers via library-specific adapters; falls back to a visual marker
-picker for DOM-rendered maps; and a network-fetch mode for WebGL/vector
-tile maps or sites that expose a JSON endpoint.
+A Chrome MV3 extension that extracts map pins from store locators and other
+map-heavy websites. It prefers structured data first, then map-library APIs,
+and uses DOM clicking only as the last fallback.
 
-## Install (developer mode)
+Supported library paths:
 
-1. Open `chrome://extensions`
-2. Enable **Developer mode** (top right)
-3. Click **Load unpacked**, pick this folder
-4. Pin the extension; click its icon to open the side panel
+- Leaflet, including `Leaflet.markercluster`
+- Google Maps JavaScript API v3, including `AdvancedMarkerElement`
+- Mapbox GL and MapLibre GL, including GeoJSON sources and clusters
+- OpenLayers vector layers
+- deck.gl layer data arrays
+- Generic DOM markers through visual pick/teach mode
 
-## Use it
+## Install
 
-The side panel walks you through four steps.
+1. Open `chrome://extensions`.
+2. Enable **Developer mode**.
+3. Click **Load unpacked** and choose this folder.
+4. Pin the extension and click it to open the side panel.
 
-**1. Detect maps.** Click "Detect". Every adapter runs its detection and
-reports confidence. If one of Leaflet/Mapbox/Google/OL is there, you'll
-see it with high confidence and an instance count. If not, all of them
-return 0 and you'll fall through to pick mode or network mode.
+## Extraction Order
 
-**2. Teach** (optional but recommended). Click "Start teach mode", then
-click a real pin on the map. Within 2 seconds we capture the popup
-HTML and any network requests that fired. The popup feeds schema
-inference (Step 3); the network requests feed Network mode (Step 4).
+The side panel now runs a data-source-first strategy:
 
-**2b. Pick mode** (for DOM-rendered maps). If detection found nothing
-and the pins are real DOM elements, click "Start pick mode" and click
-one of the pins on the page. We derive a selector that matches every
-similar element on the page and enable the generic DOM adapter.
+1. **Page data source**: the page-world script scans safe `window.*` values for
+   arrays or GeoJSON with marker-shaped coordinates.
+2. **Cached fetch/XHR response**: the page-world script clones likely JSON or
+   GeoJSON fetch/XHR responses and scans the cached bodies.
+3. **Network endpoint replay**: the service worker's teach-window request list
+   is ranked for likely location APIs and replayed with page cookies.
+4. **Library mode**: adapters enumerate native map objects without DOM scraping.
+5. **Pan mode**: Mapbox/MapLibre can sample a small map grid for viewport-culled
+   GeoJSON/query-source features, then restore the original view.
+6. **List mode**: repeated sidebar/card rows are extracted when available.
+7. **DOM zoom/click mode**: cluster-like DOM markers are expanded recursively,
+   then pins are clicked and popups are scored.
 
-**3. Schema.** Inferred fields appear as editable key/selector pairs.
-You can rename keys, tweak selectors, delete fields, or add new ones.
-Inferred fields are: name (first heading), phone (tel: link), email
-(mailto: link), website (first external http link), address (regex on
-street patterns), hours (regex on weekday + time).
+## Teach Mode
 
-**4. Enumerate.**
+Teach mode captures more than a single "largest mutation" now. For each sample
+click it records:
 
-- **Library mode** (default): runs the detected adapter's
-  enumeration. Expands clusters when possible. Applies the schema to
-  each marker's popup content. Preview + CSV/JSON export.
-- **Network mode**: fetches a URL, walks the JSON response, finds the
-  largest array of `{lat, lng, ...}`-shaped objects, returns them.
-  Click any captured request from Step 2 to pre-fill the URL.
+- the clicked marker selector, scored with map-specific positive/negative signs;
+- the full mutation sequence, including child, attribute, and text changes;
+- all popup candidates, scored by visibility, contact/address patterns, and
+  whether the element was empty before the click;
+- the best popup HTML for schema inference.
 
-**Save profile** remembers the adapter, mode, schema, and URL for the
-site's origin. Revisit the site later — the panel loads the profile
-automatically and you can skip straight to enumerate.
+Clicking several pins lets the side panel merge inferred fields across samples,
+which makes popup templates much less brittle.
 
-## Architecture
+## Library Hooks
 
+Constructor hooks are installed at `document_start` in the page world so they can
+see `window.L`, `window.google`, `window.mapboxgl`, and similar globals before
+the site's bundle creates the map.
+
+| Library | Hook / enumeration path |
+| --- | --- |
+| Leaflet | Hook `L.Map`, walk `map._layers`, filter `L.Marker`, expand `getAllChildMarkers()` |
+| Google Maps | Hook `google.maps.Map`, `google.maps.Marker`, and `google.maps.marker.AdvancedMarkerElement` |
+| Mapbox GL / MapLibre | Hook `Map`, `Marker`, and `addLayer`; read GeoJSON sources and `getClusterLeaves()` |
+| OpenLayers | Hook `ol.Map`, walk vector layers and cluster feature leaves |
+| deck.gl | Hook `Deck`, capture layer props, read `props.data` and `getPosition` |
+
+## Project Layout
+
+| Path | Purpose |
+| --- | --- |
+| `manifest.json` | MV3 config |
+| `src/background/service-worker.js` | Side panel open, message routing, teach-window request buffer |
+| `src/content/content-script.js` | Isolated-world bridge, teach mode, picker, cookie-aware fetch |
+| `src/content/capture-heuristics.js` | Marker selector and popup candidate scoring |
+| `src/injected/page-script.js` | Page-world hooks, data-source scan, adapter command bridge |
+| `src/injected/detector.js` | Adapter detection and hook installation |
+| `src/injected/adapters/*.js` | Library and DOM adapters |
+| `src/shared/network-fetch.js` | JSON/GeoJSON endpoint parsing and marker-array detection |
+| `src/shared/schema-selectors.js` | Safe selector application |
+| `src/sidepanel/*` | UI and extraction strategy |
+| `tests/*` | Focused helper tests and syntax check |
+
+## Development Checks
+
+```bash
+npm test
+npm run check:syntax
 ```
-┌───────────────┐       chrome.runtime           ┌──────────────────────┐
-│  side panel   │ ◄────────────────────────────► │   service worker     │
-│  sidepanel.js │                                │  webRequest buffer   │
-└───────┬───────┘                                └──────────┬───────────┘
-        │ chrome.tabs.sendMessage                           │
-        ▼                                                   ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                       TAB — isolated worlds                          │
-│                                                                      │
-│   content-script.js  (isolated)                                      │
-│    teach / pick / forward / fetch-with-cookies                       │
-│        │                                                             │
-│        │ injects <script type="module">  +  window.postMessage       │
-│        ▼                                                             │
-│   page-script.js  (MAIN world — window.L, window.google, …)          │
-│        │                                                             │
-│        └── detector.js  ──►  adapters/*.js                           │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
-Two scripts per tab because content scripts live in an isolated JS
-world and can't see the page's globals (`window.L`, `window.google`,
-etc.), while page-world scripts can't call `chrome.*` APIs. The
-content script bridges postMessage ↔ chrome.runtime and hosts pick /
-teach modes (which need DOM event capture + highlight styling).
-
-## The adapter pattern
-
-Every map-library adapter extends `BaseAdapter` (in
-`src/injected/adapters/base-adapter.js`) and implements:
-
-- `detect()` — "is this library in use?" returns confidence + instance
-  handles. Never mutates the page.
-- `enumerateMarkers(instance, opts)` — returns a list of
-  `{ id, lat, lng, raw }` for every marker, including markers hidden
-  inside clusters.
-- `extractMarkerData(marker, schemaHint)` — pulls serializable fields
-  off one marker. Takes the optional `schemaHint` from the teach flow.
-
-Constructor hooks (installed at `document_start`) capture map +
-marker instances as they're created:
-
-| Library     | Hooks                                                        |
-| ----------- | ------------------------------------------------------------ |
-| Leaflet     | `L.Map.prototype.initialize`                                 |
-| Mapbox GL   | `mapboxgl.Map`, `mapboxgl.Marker` (+ maplibregl aliases)     |
-| Google Maps | `google.maps.Map`, `google.maps.Marker`, `AdvancedMarkerElement` |
-| OpenLayers  | `ol.Map` (only on sites with a window.ol global)             |
 
 ## Limitations
 
-- **Bundled OpenLayers apps** without a `window.ol` global can't be
-  hooked. Detection shows "bundled OL — can't hook". Fall back to
-  network mode if there's a JSON endpoint, or pick mode if the pins
-  are in the DOM.
-- **WebGL vector-tile maps** render markers on canvas — no DOM, no
-  data array. Library-mode enumeration works for GeoJSON sources
-  (Mapbox reads `_data`) but not for vector-tile sources. Network mode
-  is the workaround.
-- **Google Places**: Google's Terms of Service forbid scraping the
-  Places / Maps database. Scraping a third-party site that happens to
-  display its own data on Google Maps (e.g. a store locator) is
-  usually fine; check the target site's ToS.
-- **Hook misses**: if the site constructs its map before our content
-  script runs (rare — we run at document_start — but possible on the
-  very first page load when the extension is freshly installed), the
-  adapter reports "hook missed construction" and DOM-only fallback
-  kicks in with no lat/lng. Reload the page to fix.
-- **Rate limits**: pick-mode's DOM adapter clicks each pin with a
-  200ms delay. A page with 500 pins takes ~100 seconds. For Network
-  mode there's no per-marker cost — one fetch for the whole set.
+- Bundled OpenLayers apps without a `window.ol` global cannot be hooked; use
+  page data, network, or DOM fallback.
+- Vector-tile-only Mapbox layers do not expose all source rows as GeoJSON.
+  Network/data-source extraction is still the best path for those.
+- Google Places data is governed by Google's terms. This tool is intended for
+  extracting a site's own location data, not scraping Google's Places database.
+- Hook misses can happen if a page builds the map before the extension is active.
+  Reloading the page usually gives the document-start hooks a clean shot.
 
-## File map
+## Publishing Note
 
-| File                                           | Role                                   |
-| ---------------------------------------------- | -------------------------------------- |
-| `manifest.json`                                | MV3 config                             |
-| `src/background/service-worker.js`             | Sidepanel open, webRequest buffer      |
-| `src/content/content-script.js`                | Isolated-world bridge + teach + pick + fetch |
-| `src/content/overlay.css`                      | Pick-mode highlight style              |
-| `src/injected/page-script.js`                  | MAIN-world entry, progress emit        |
-| `src/injected/detector.js`                     | Runs all adapters, picks winner        |
-| `src/injected/adapters/base-adapter.js`        | Adapter interface                      |
-| `src/injected/adapters/leaflet-adapter.js`     | Leaflet (markercluster included)       |
-| `src/injected/adapters/mapbox-adapter.js`      | Mapbox GL + MapLibre (HTML + GeoJSON)  |
-| `src/injected/adapters/google-maps-adapter.js` | Google Maps (legacy + Advanced)        |
-| `src/injected/adapters/openlayers-adapter.js`  | OpenLayers (layer/feature walk)        |
-| `src/injected/adapters/dom-adapter.js`         | Generic DOM click-through              |
-| `src/sidepanel/*`                              | User-facing UI                         |
-| `src/shared/messages.js`                       | Message-type constants                 |
-| `src/shared/schema.js`                         | Schema-inference heuristics            |
-| `src/shared/profiles.js`                       | Per-site profile storage               |
-| `src/shared/network-fetch.js`                  | Network mode: fetch + JSON auto-walk   |
-| `src/shared/export.js`                         | CSV helpers                            |
-
-## Publishing to the Chrome Web Store
-
-Before you publish, change `"<all_urls>"` in `host_permissions` to
-`"optional_host_permissions"` and request per-site access via
-`chrome.permissions.request()` when the user clicks Detect. Review gets
-much easier and it's safer for users.
-
-## ToS reminder
-
-Scraping markers off a site you don't own may violate that site's Terms
-of Service. Use this on sites where the data is offered for this kind of
-use (public OSM with attribution, your own store locator, research
-exempted by ToS, etc.). Respect robots.txt and rate limits.
+Before publishing, consider replacing broad `host_permissions` with optional
+host permissions requested only when capture starts. The current implementation
+keeps the request buffer scoped to active teach sessions, but optional host
+permissions are easier for users and reviewers to reason about.
