@@ -288,6 +288,16 @@ async function readGeoJsonFeatures(map, sourceId, source, sourceDef, { expandClu
 
 async function collectMapboxClusterLeaves(map, source, sourceId) {
   const out = [];
+  // querySourceFeatures returns nothing useful until the style + tiles
+  // for the source have settled. Wait for an idle event (or our 2 s
+  // safety timeout) so we don't miss every cluster on a freshly
+  // recovered map.
+  if (typeof map.isStyleLoaded === "function" && !map.isStyleLoaded()) {
+    await waitForMapIdle(map, 2000);
+  } else if (typeof map.areTilesLoaded === "function" && !map.areTilesLoaded()) {
+    await waitForMapIdle(map, 1500);
+  }
+
   const layers = (map.getStyle?.()?.layers || []).filter((layer) => layer.source === sourceId);
   if (!layers.length) return out;
 

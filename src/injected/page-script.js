@@ -30,10 +30,24 @@ function reply(id, body) {
   window.postMessage({ source: FROM_PAGE, token: BRIDGE_TOKEN, id, ...body }, "*");
 }
 
+// Light cache around detectAll so the (unavoidable) detect call inside
+// ENUMERATE doesn't re-run every adapter when DETECT just finished.
+// 1.5s TTL — long enough to cover a normal click → run cycle, short
+// enough that newly-added markers aren't ignored on a long-running session.
+let _detectCache = null;
+let _detectCacheAt = 0;
+async function cachedDetectAll() {
+  if (_detectCache && Date.now() - _detectCacheAt < 1500) return _detectCache;
+  _detectCache = await detectAll();
+  _detectCacheAt = Date.now();
+  return _detectCache;
+}
+
 async function handle(cmd, payload) {
   switch (cmd) {
     case "DETECT": {
-      const results = await detectAll();
+      _detectCache = null;     // user-initiated detect always reruns
+      const results = await cachedDetectAll();
       return results.map((result) => ({
         adapter: result.adapter,
         confidence: result.confidence,
@@ -52,7 +66,7 @@ async function handle(cmd, payload) {
         schemaHint = null,
         mode = "library",
       } = payload || {};
-      const results = await detectAll();
+      const results = await cachedDetectAll();
       const chosen = results.find((result) => result.adapter === adapterName);
       if (!chosen) throw new Error(`No detection for ${adapterName}`);
       const instance = chosen.instances[instanceIndex]
@@ -314,19 +328,35 @@ function installNetworkResponseCacheHook() {
   if (window.__MMS_RESPONSE_CACHE_HOOKED__) return;
   window.__MMS_RESPONSE_CACHE_HOOKED__ = true;
   const cache = (window.__MMS_RESPONSE_CACHE__ ||= []);
+  const MAX_ENTRIES = 40;
+  const MAX_BYTES = 8 * 1024 * 1024;       // 8 MB total budget for cached bodies
+  const MAX_PER_RESPONSE = 2_000_000;
+  let totalBytes = cache.reduce((n, e) => n + (e.text?.length || 0), 0);
 
   const record = (entry) => {
     if (!entry?.url || !entry.text) return;
     if (!isLikelyJsonResponse(entry.url, entry.contentType, entry.text)) return;
+    const text = entry.text.slice(0, MAX_PER_RESPONSE);
     cache.push({
       url: entry.url,
       contentType: entry.contentType || "",
       status: entry.status || 0,
-      text: entry.text.slice(0, 2_000_000),
+      text,
       ts: Date.now(),
     });
-    while (cache.length > 40) cache.shift();
+    totalBytes += text.length;
+    // Evict oldest until we're back under both caps.
+    while (cache.length > 0 && (cache.length > MAX_ENTRIES || totalBytes > MAX_BYTES)) {
+      const dropped = cache.shift();
+      totalBytes -= dropped.text?.length || 0;
+    }
   };
+
+  // Drop the cache when the tab is being torn down so we don't hold on to
+  // hundreds of MB across SPA reloads.
+  const clearCache = () => { cache.length = 0; totalBytes = 0; };
+  window.addEventListener("pagehide", clearCache, { once: false });
+  window.addEventListener("beforeunload", clearCache, { once: false });
 
   if (typeof window.fetch === "function" && !window.fetch.__mmsHooked) {
     const originalFetch = window.fetch;

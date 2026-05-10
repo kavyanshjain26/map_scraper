@@ -83,6 +83,17 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   TEACH_TABS.delete(tabId);
 });
 
+// Top-level navigations clear the in-page state (and our content script
+// reloads), so any teach session armed in the previous document is gone.
+// Drop our bookkeeping for that tab so the buffer doesn't keep growing
+// across SPA reloads / hard reloads where the STOP message never lands.
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.status === "loading") {
+    TEACH_TABS.delete(tabId);
+    RECENT.delete(tabId);
+  }
+});
+
 // Expose the buffer to the sidepanel.
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.type === "GET_RECENT_REQUESTS") {

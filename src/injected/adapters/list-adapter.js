@@ -20,41 +20,73 @@ const DETECTED = (window.__MMS_LIST_DETECTED__ ||= { count: 0, selector: null })
 // share the same tag + a common class, ≥3 repetitions, ≥40 chars of
 // text each (skip nav menus, tag clouds, etc.).
 export function preDetectList() {
-  const containers = document.querySelectorAll("*");
+  // Bound the scan — on a 50k-element page we don't want to visit every
+  // node. Start with elements likely to be card containers (the most
+  // common shapes have 3+ direct children with semantic classes/tags),
+  // and stop after a generous budget. We also skip giant containers
+  // (>800 kids) up front because those are usually virtualisation
+  // wrappers, not card lists.
+  const SCAN_BUDGET = 6000;
+  const MIN_CARDS = 3;
+  const MAX_CARDS = 500;
+  let scanned = 0;
   let best = { count: 0, selector: null };
 
-  for (const parent of containers) {
-    const kids = parent.children;
-    if (!kids || kids.length < 3 || kids.length > 500) continue;
-
-    // All children same tag?
-    const tag = kids[0].tagName;
-    let allSameTag = true;
-    for (const k of kids) {
-      if (k.tagName !== tag) {
-        allSameTag = false;
-        break;
-      }
+  // Fast pre-filter: only inspect parents whose first child has a class
+  // (cards almost always have one). Falls back to a full sweep only if
+  // that early pass found nothing.
+  const collectFromQuery = (selector) => {
+    let nodes;
+    try { nodes = document.querySelectorAll(selector); } catch (_) { return; }
+    for (const parent of nodes) {
+      if (++scanned > SCAN_BUDGET) return;
+      considerParent(parent);
     }
-    if (!allSameTag) continue;
+  };
 
-    // Find a class that all children share.
-    const firstClasses = Array.from(kids[0].classList || []);
-    const shared = firstClasses.find((cls) =>
-      Array.from(kids).every((k) => k.classList?.contains(cls))
-    );
-    if (!shared) continue;
+  const considerParent = (parent) => {
+    const kids = parent.children;
+    if (!kids || kids.length < MIN_CARDS || kids.length > MAX_CARDS) return;
 
-    // Filter by text density — skip nav rows, icon grids.
+    const tag = kids[0].tagName;
+    for (let i = 1; i < kids.length; i++) {
+      if (kids[i].tagName !== tag) return;
+    }
+
+    const firstClasses = kids[0].classList || [];
+    let shared = null;
+    for (const cls of firstClasses) {
+      let all = true;
+      for (let i = 1; i < kids.length; i++) {
+        if (!kids[i].classList?.contains(cls)) { all = false; break; }
+      }
+      if (all) { shared = cls; break; }
+    }
+    if (!shared) return;
+
     let textRich = 0;
     for (const k of kids) {
       const t = (k.textContent || "").trim();
       if (t.length >= 40) textRich++;
     }
-    if (textRich < Math.max(3, kids.length * 0.6)) continue;
+    if (textRich < Math.max(MIN_CARDS, kids.length * 0.6)) return;
 
     if (kids.length > best.count) {
       best = { count: kids.length, selector: `${tag.toLowerCase()}.${cssEscape(shared)}` };
+    }
+  };
+
+  // Pass 1: parents whose first child has a class — cheap and covers >95%
+  // of card layouts.
+  collectFromQuery("*:has(> *[class])");
+  // Pass 2 (fallback): broader sweep if pass 1 found nothing. The :has
+  // query above is supported in modern Chrome but we still want a path
+  // through if it ever fails to compile or returns nothing.
+  if (!best.selector && scanned < SCAN_BUDGET) {
+    const all = document.getElementsByTagName("*");
+    for (let i = 0; i < all.length; i++) {
+      if (++scanned > SCAN_BUDGET) break;
+      considerParent(all[i]);
     }
   }
 

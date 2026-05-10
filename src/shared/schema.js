@@ -45,6 +45,28 @@ export function inferSchema(input) {
   const heading = root.querySelector("h1, h2, h3, h4, [role='heading']");
   if (heading) push("name", heading);
 
+  // 1b. Label/value pairs in tables and definition lists. Common on
+  //     locator card popups, esp. for hours/address/phone rows where
+  //     the visible label tells us exactly what the value means. Try
+  //     <th>+<td>, <td>+<td>, and <dt>+<dd> shapes.
+  for (const row of root.querySelectorAll("tr")) {
+    const cells = row.querySelectorAll("th, td");
+    if (cells.length < 2) continue;
+    const labelCell = cells[0];
+    const valueCell = cells[cells.length - 1];
+    if (labelCell === valueCell) continue;
+    const key = normalizeLabel(labelCell.textContent || "");
+    if (!key) continue;
+    push(key, valueCell);
+  }
+  for (const dt of root.querySelectorAll("dt")) {
+    const dd = dt.nextElementSibling;
+    if (!dd || dd.tagName !== "DD") continue;
+    const key = normalizeLabel(dt.textContent || "");
+    if (!key) continue;
+    push(key, dd);
+  }
+
   // 2. Links with special schemes. Use attribute selectors directly —
   //    they're unambiguous and survive DOM wrapping differences between
   //    popups.
@@ -111,6 +133,30 @@ function cssPath(el, root) {
     cur = cur.parentElement;
   }
   return parts.join(" > ");
+}
+
+// Normalise a row/term label into a snake_case schema key. Drops
+// punctuation and trailing colons ("Phone Number:" → "phone_number").
+// Returns "" for empty / unhelpful labels.
+const KEYABLE_LABELS = new Set([
+  "name", "address", "phone", "telephone", "fax", "email", "hours",
+  "open", "closed", "website", "url", "city", "state", "zip", "postal",
+  "country", "region", "manager", "contact", "category",
+]);
+function normalizeLabel(raw) {
+  const cleaned = String(raw || "")
+    .replace(/[ \s]+/g, " ")
+    .trim()
+    .replace(/[:\-—–]\s*$/, "")
+    .toLowerCase();
+  if (!cleaned || cleaned.length > 32) return "";
+  const key = cleaned.replace(/[^\w]+/g, "_").replace(/^_|_$/g, "");
+  if (!key) return "";
+  // Whitelist the most common labels to avoid junk like "see_more" or
+  // multiparagraph blurbs that happen to share a parent shape.
+  if (KEYABLE_LABELS.has(key)) return key;
+  if (/^[a-z_]{2,16}$/.test(key)) return key;
+  return "";
 }
 
 // CSS.escape fallback — CSS.escape is everywhere in Chrome, but guard
