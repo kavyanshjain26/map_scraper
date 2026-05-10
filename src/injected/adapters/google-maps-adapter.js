@@ -60,7 +60,9 @@ export function installGoogleHook() {
       const Original = g.Marker;
       function Hooked(...args) {
         const inst = new Original(...args);
-        try { MARKER_INSTANCES.push({ kind: "marker", marker: inst }); } catch (_) {}
+        let originalMap = null;
+        if (args[0] && typeof args[0] === "object") originalMap = args[0].map || null;
+        try { MARKER_INSTANCES.push({ kind: "marker", marker: inst, originalMap }); } catch (_) {}
         return inst;
       }
       Hooked.prototype = Original.prototype;
@@ -77,7 +79,9 @@ export function installGoogleHook() {
       const Original = am;
       function Hooked(...args) {
         const inst = new Original(...args);
-        try { MARKER_INSTANCES.push({ kind: "advanced", marker: inst }); } catch (_) {}
+        let originalMap = null;
+        if (args[0] && typeof args[0] === "object") originalMap = args[0].map || null;
+        try { MARKER_INSTANCES.push({ kind: "advanced", marker: inst, originalMap }); } catch (_) {}
         return inst;
       }
       Hooked.prototype = Original.prototype;
@@ -121,41 +125,24 @@ export class GoogleMapsAdapter extends BaseAdapter {
     return { confidence: 0.3, reason: "google.maps present, hook missed construction", instances: [] };
   }
 
-  async enumerateMarkers(instance, { expandClusters = true } = {}) {
+  async enumerateMarkers(instance, { expandClusters = true, deepScan = false } = {}) {
     if (instance.kind !== "live") {
       throw new Error("Google Maps DOM-only enumeration not supported — reload with the extension active");
     }
     const map = instance.map;
-    const out = [];
-    let id = 0;
 
-    for (const rec of MARKER_INSTANCES) {
-      const m = rec.marker;
-      if (m.map !== map && m.getMap?.() !== map) continue;
-
-      let lat, lng;
-      if (rec.kind === "marker") {
-        const pos = m.getPosition?.();
-        if (!pos) continue;
-        lat = typeof pos.lat === "function" ? pos.lat() : pos.lat;
-        lng = typeof pos.lng === "function" ? pos.lng() : pos.lng;
-      } else {
-        // AdvancedMarkerElement: .position is LatLng | LatLngLiteral
-        const p = m.position;
-        if (!p) continue;
-        lat = typeof p.lat === "function" ? p.lat() : p.lat;
-        lng = typeof p.lng === "function" ? p.lng() : p.lng;
-      }
-      if (!Number.isFinite(lat) || !Number.isFinite(lng)) continue;
-
-      out.push({
-        id: `google-${rec.kind}-${id++}`,
-        lat, lng,
-        raw: rec,
-      });
+    // If the page lazy-loads markers based on viewport (very common pattern
+    // for store locators), pan/zoom across the map to trigger fetches.
+    // Otherwise we'd only see whatever's currently visible.
+    if (deepScan) {
+      await deepScanGoogle(map);
+    } else if (expandClusters) {
+      // Cheap zoom-out: many sites' clusters hide most markers. Try a brief
+      // zoom-out sequence so MarkerClusterer's full set gets registered.
+      await briefZoomOutGoogle(map);
     }
 
-    return out;
+    return collectGoogleMarkers(map);
   }
 
   async extractMarkerData(record, schemaHint = null) {
@@ -191,6 +178,145 @@ export class GoogleMapsAdapter extends BaseAdapter {
 
     return out;
   }
+}
+
+// Collect every hooked marker that belongs (now or originally) to this map.
+// We accept markers whose .map is currently null because cluster libraries
+// like @googlemaps/markerclusterer detach markers from the map while they
+// live inside a cluster bubble. Filtering only by current .map would lose
+// those — i.e. lose every clustered point on the page.
+function collectGoogleMarkers(map) {
+  const out = [];
+  const seen = new Set();
+  let id = 0;
+  const onlyMap = MAP_INSTANCES.length <= 1;
+
+  for (const rec of MARKER_INSTANCES) {
+    const m = rec.marker;
+    const currentMap = rec.kind === "marker" ? m.getMap?.() : m.map;
+    const belongs =
+      currentMap === map ||
+      rec.originalMap === map ||
+      (onlyMap && (currentMap == null && rec.originalMap == null));
+    if (!belongs) continue;
+
+    let lat, lng;
+    if (rec.kind === "marker") {
+      const pos = m.getPosition?.();
+      if (!pos) continue;
+      lat = typeof pos.lat === "function" ? pos.lat() : pos.lat;
+      lng = typeof pos.lng === "function" ? pos.lng() : pos.lng;
+    } else {
+      const p = m.position;
+      if (!p) continue;
+      lat = typeof p.lat === "function" ? p.lat() : p.lat;
+      lng = typeof p.lng === "function" ? p.lng() : p.lng;
+    }
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) continue;
+
+    // Dedupe by lat/lng (4 decimals ≈ 11m tolerance).
+    const k = `${lat.toFixed(5)},${lng.toFixed(5)}`;
+    if (seen.has(k)) continue;
+    seen.add(k);
+
+    out.push({
+      id: `google-${rec.kind}-${id++}`,
+      lat, lng,
+      raw: rec,
+    });
+  }
+  return out;
+}
+
+// Wait for the map to settle (idle event) — emitted when tiles are loaded
+// and any pending pan/zoom animation has finished.
+function waitIdle(map, timeoutMs = 2500) {
+  const g = window.google?.maps;
+  return new Promise((resolve) => {
+    if (!g?.event) { setTimeout(resolve, timeoutMs); return; }
+    const t = setTimeout(resolve, timeoutMs);
+    const listener = g.event.addListenerOnce(map, "idle", () => {
+      clearTimeout(t);
+      resolve();
+    });
+    // Safety: also resolve if listener registration silently fails.
+    if (!listener) { clearTimeout(t); resolve(); }
+  });
+}
+
+// One-shot zoom-out + back-in. Cheap nudge to make MarkerClusterer dump its
+// full marker set (some implementations only register markers once visible).
+async function briefZoomOutGoogle(map) {
+  try {
+    const z = map.getZoom?.();
+    if (typeof z !== "number") return;
+    if (z > 3) {
+      map.setZoom(Math.max(2, z - 4));
+      await waitIdle(map, 1500);
+      map.setZoom(z);
+      await waitIdle(map, 1500);
+    }
+  } catch (_) { /* best-effort */ }
+}
+
+// Pan-and-zoom sweep. Drives the map across a 3x3 grid at multiple zoom
+// levels. Triggers viewport-bound AJAX loaders. Pages already-known markers
+// remain in MARKER_INSTANCES; new ones get added by our constructor hook.
+async function deepScanGoogle(map) {
+  const g = window.google?.maps;
+  if (!g?.LatLng) return;
+
+  const startCenter = map.getCenter?.();
+  const startZoom = map.getZoom?.();
+
+  // Step 1: try to fit known markers, then zoom out further to trigger
+  // global-bounds queries.
+  const known = collectGoogleMarkers(map);
+  let north = 60, south = -55, east = 170, west = -170;   // continental fallback
+  if (known.length >= 2) {
+    north = Math.max(...known.map(m => m.lat));
+    south = Math.min(...known.map(m => m.lat));
+    east  = Math.max(...known.map(m => m.lng));
+    west  = Math.min(...known.map(m => m.lng));
+    // Pad 20%
+    const padLat = Math.max(0.5, (north - south) * 0.2);
+    const padLng = Math.max(0.5, (east  - west)  * 0.2);
+    north += padLat; south -= padLat;
+    east  += padLng; west  -= padLng;
+  }
+
+  try {
+    const bounds = new g.LatLngBounds(
+      new g.LatLng(south, west),
+      new g.LatLng(north, east),
+    );
+    map.fitBounds(bounds);
+    await waitIdle(map, 2500);
+  } catch (_) { /* ignore */ }
+
+  // Step 2: 3x3 pan grid at the fitted zoom.
+  const grid = 3;
+  const fitZoom = map.getZoom?.() ?? 4;
+  const stepLat = (north - south) / grid;
+  const stepLng = (east  - west)  / grid;
+  for (let i = 0; i < grid; i++) {
+    for (let j = 0; j < grid; j++) {
+      const lat = south + stepLat * (i + 0.5);
+      const lng = west  + stepLng * (j + 0.5);
+      try {
+        map.setCenter(new g.LatLng(lat, lng));
+        map.setZoom(Math.max(fitZoom + 1, 6));
+        await waitIdle(map, 1500);
+      } catch (_) { /* ignore */ }
+    }
+  }
+
+  // Step 3: restore initial viewport so the user's view isn't disturbed.
+  try {
+    if (startCenter) map.setCenter(startCenter);
+    if (typeof startZoom === "number") map.setZoom(startZoom);
+    await waitIdle(map, 1000);
+  } catch (_) { /* ignore */ }
 }
 
 // Click the marker and wait for an InfoWindow to render in the DOM.

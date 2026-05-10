@@ -52,7 +52,7 @@ async function handle(cmd, payload) {
     }
 
     case "ENUMERATE": {
-      const { adapterName, instanceIndex = 0, expandClusters = true, schemaHint = null } = payload || {};
+      const { adapterName, instanceIndex = 0, expandClusters = true, deepScan = false, schemaHint = null } = payload || {};
       const results = await detectAll();
       const chosen  = results.find(r => r.adapter === adapterName);
       if (!chosen) throw new Error(`No detection for ${adapterName}`);
@@ -63,7 +63,7 @@ async function handle(cmd, payload) {
       if (!instance) throw new Error(`No instance #${instanceIndex} for ${adapterName}`);
 
       const adapter = new chosen.ctor();
-      const markers = await adapter.enumerateMarkers(instance, { expandClusters, schemaHint });
+      const markers = await adapter.enumerateMarkers(instance, { expandClusters, deepScan, schemaHint });
 
       // Emit ~20 progress updates across the run, regardless of total.
       // Each update ships both the running count AND the newly-extracted

@@ -516,6 +516,8 @@ async function runAutoStrategy() {
   const hasListTeaching = !!schemaHint?.listSelector;
   const tryListFirst = hasListTeaching && (!detectedAdapter || detectedListCount > (detectedMarkerCount || 0));
 
+  const deepScan = $("#chkDeepScan")?.checked || false;
+
   if (tryListFirst) {
     try {
       updateRunProgress(0, 0);
@@ -524,6 +526,7 @@ async function runAutoStrategy() {
         adapterName: "List (cards/rows)",
         instanceIndex: 0,
         expandClusters: false,
+        deepScan: false,
         schemaHint,
       });
       attempts.push({ name: "List (cards/rows)", count: result.count, ok: result.count > 0 });
@@ -542,13 +545,16 @@ async function runAutoStrategy() {
   if (detectedAdapter) {
     try {
       updateRunProgress(0, 0);
-      $("#runEtaText").textContent = `Trying ${humanAdapter(detectedAdapter)}…`;
+      $("#runEtaText").textContent = deepScan
+        ? `Deep-scanning ${humanAdapter(detectedAdapter)} (panning the map)…`
+        : `Trying ${humanAdapter(detectedAdapter)}…`;
       lastMarkers = [];
       renderPreview([]);
       const result = await sendToTab(MSG.ENUMERATE_MARKERS, {
         adapterName: detectedAdapter,
         instanceIndex: 0,
         expandClusters: $("#chkClusters").checked,
+        deepScan,
         schemaHint,
       });
       attempts.push({ name: `Map library (${detectedAdapter})`, count: result.count, ok: result.count > 0 });
@@ -590,6 +596,7 @@ async function runAutoStrategy() {
         adapterName: "List (cards/rows)",
         instanceIndex: 0,
         expandClusters: false,
+        deepScan: false,
         schemaHint,
       });
       attempts.push({ name: "List (cards/rows)", count: result.count, ok: result.count > 0 });
@@ -615,6 +622,7 @@ async function runAutoStrategy() {
         adapterName: "DOM (generic)",
         instanceIndex: 0,
         expandClusters: false,
+        deepScan: false,
         schemaHint,
       });
       attempts.push({ name: "DOM click", count: result.count, ok: result.count > 0 });

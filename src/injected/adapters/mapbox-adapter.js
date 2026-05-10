@@ -98,29 +98,35 @@ export class MapboxAdapter extends BaseAdapter {
 
   get rendersToCanvas() { return true; }
 
-  async enumerateMarkers(instance, { expandClusters = true } = {}) {
+  async enumerateMarkers(instance, { expandClusters = true, deepScan = false } = {}) {
     if (instance.kind !== "live") {
       throw new Error("Mapbox DOM-only enumeration not supported — reload with the extension active");
     }
     const map = instance.map;
+
+    if (deepScan) await deepScanMapbox(map);
+
     const out = [];
+    const seen = new Set();
     let id = 0;
+
+    const push = (lat, lng, raw) => {
+      if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
+      const k = `${lat.toFixed(5)},${lng.toFixed(5)}`;
+      if (seen.has(k)) return;
+      seen.add(k);
+      out.push({ id: `mapbox-${id++}`, lat, lng, raw });
+    };
 
     // --- (1) HTML markers via our Marker registry ---
     for (const m of MARKER_INSTANCES) {
-      if (m._map !== map) continue;   // different map on the page
+      if (m._map !== map) continue;
       const ll = m.getLngLat?.();
       if (!ll) continue;
-      out.push({
-        id: `mapbox-html-${id++}`,
-        lat: ll.lat,
-        lng: ll.lng,
-        raw: { kind: "html-marker", marker: m },
-      });
+      push(ll.lat, ll.lng, { kind: "html-marker", marker: m });
     }
 
     // --- (2) GeoJSON-source features ---
-    // Wait for the style to be loaded or we get nothing.
     if (!map.isStyleLoaded?.()) {
       await new Promise((res) => {
         const t = setTimeout(res, 2000);
@@ -138,30 +144,40 @@ export class MapboxAdapter extends BaseAdapter {
 
       let data = src._data;
       if (typeof data === "string") {
-        // URL — fetch it. Same-origin is fine; cross-origin requires CORS.
         try {
           const res = await fetch(data, { credentials: "same-origin" });
           if (!res.ok) continue;
           data = await res.json();
         } catch (_) { continue; }
       }
-      if (!data || data.type !== "FeatureCollection" || !Array.isArray(data.features)) continue;
 
-      for (const feat of data.features) {
-        if (feat.geometry?.type !== "Point") continue;
-        const [lng, lat] = feat.geometry.coordinates;
-        if (!Number.isFinite(lat) || !Number.isFinite(lng)) continue;
-        // Skip cluster aggregation features — `cluster: true` marks them.
-        if (feat.properties?.cluster) continue;
-        out.push({
-          id: `mapbox-geojson-${srcId}-${id++}`,
-          lat, lng,
-          raw: {
+      // Source has clustering enabled. Walk the active clusters and ask
+      // mapbox-gl for the leaves — handles dynamic data better than reading
+      // _data, and works even when the source was built incrementally.
+      if (srcDef.cluster && expandClusters && typeof src.getClusterLeaves === "function") {
+        const leaves = await collectMapboxClusterLeaves(map, src, srcId);
+        for (const feat of leaves) {
+          if (feat.geometry?.type !== "Point") continue;
+          const [lng, lat] = feat.geometry.coordinates;
+          push(lat, lng, {
             kind: "geojson-feature",
             sourceId: srcId,
             properties: feat.properties || {},
-          },
-        });
+          });
+        }
+      }
+
+      if (data && data.type === "FeatureCollection" && Array.isArray(data.features)) {
+        for (const feat of data.features) {
+          if (feat.geometry?.type !== "Point") continue;
+          if (feat.properties?.cluster) continue;
+          const [lng, lat] = feat.geometry.coordinates;
+          push(lat, lng, {
+            kind: "geojson-feature",
+            sourceId: srcId,
+            properties: feat.properties || {},
+          });
+        }
       }
     }
 
@@ -199,6 +215,101 @@ export class MapboxAdapter extends BaseAdapter {
 
     return out;
   }
+}
+
+// Walk every cluster in the source and pull its leaves out via the source's
+// own getClusterLeaves API. We page through 500-leaf chunks for large
+// clusters. Cheaper than zooming the map for each cluster.
+async function collectMapboxClusterLeaves(map, src, srcId) {
+  const out = [];
+  const layers = (map.getStyle?.()?.layers || []).filter(l => l.source === srcId);
+  if (!layers.length) return out;
+
+  // Find clusters currently rendered. Iterate until we've seen the full set.
+  // We zoom to the source's bounds first so clusters cover the whole dataset.
+  const seenIds = new Set();
+  const clusters = [];
+  for (const layer of layers) {
+    let feats = [];
+    try { feats = map.querySourceFeatures(srcId, { sourceLayer: layer["source-layer"] }); }
+    catch (_) { continue; }
+    for (const f of feats) {
+      const id = f.properties?.cluster_id;
+      if (id != null && !seenIds.has(id)) {
+        seenIds.add(id);
+        clusters.push({ id, count: f.properties.point_count || 1000 });
+      }
+    }
+  }
+
+  for (const c of clusters) {
+    let offset = 0;
+    while (offset < c.count) {
+      const leaves = await new Promise((resolve) => {
+        try {
+          src.getClusterLeaves(c.id, 500, offset, (err, feats) => {
+            if (err) resolve([]);
+            else resolve(feats || []);
+          });
+        } catch (_) { resolve([]); }
+      });
+      if (leaves.length === 0) break;
+      out.push(...leaves);
+      offset += leaves.length;
+      if (leaves.length < 500) break;
+    }
+  }
+  return out;
+}
+
+function waitMapboxIdle(map, timeoutMs = 2000) {
+  return new Promise((resolve) => {
+    const t = setTimeout(resolve, timeoutMs);
+    map.once?.("idle", () => { clearTimeout(t); resolve(); });
+  });
+}
+
+// Pan-and-zoom sweep for Mapbox/MapLibre. Same goal as Leaflet's: trigger
+// any viewport-bound data loaders (vector tiles, AJAX layers).
+async function deepScanMapbox(map) {
+  const startCenter = map.getCenter?.();
+  const startZoom = map.getZoom?.();
+
+  let south = -55, west = -170, north = 60, east = 170;
+  try {
+    const b = map.getBounds?.();
+    if (b) {
+      south = b.getSouth(); west = b.getWest();
+      north = b.getNorth(); east = b.getEast();
+    }
+  } catch (_) { /* ignore */ }
+
+  // Try the world first to ensure broad data is requested.
+  try {
+    map.fitBounds([[-170, -55], [170, 60]], { animate: false, duration: 0 });
+    await waitMapboxIdle(map);
+  } catch (_) { /* ignore */ }
+
+  // 3x3 grid sweep at moderate zoom.
+  const grid = 3;
+  for (let i = 0; i < grid; i++) {
+    for (let j = 0; j < grid; j++) {
+      const lat = -55 + (115 / grid) * (i + 0.5);
+      const lng = -170 + (340 / grid) * (j + 0.5);
+      try {
+        map.jumpTo?.({ center: [lng, lat], zoom: 5 });
+        await waitMapboxIdle(map);
+      } catch (_) { /* ignore */ }
+    }
+  }
+
+  // Restore.
+  try {
+    if (startCenter && typeof startZoom === "number") {
+      map.jumpTo?.({ center: startCenter, zoom: startZoom });
+      await waitMapboxIdle(map, 800);
+    }
+  } catch (_) { /* ignore */ }
 }
 
 function applySchema(rootEl, schemaHint) {

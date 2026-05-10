@@ -87,8 +87,11 @@ export class LeafletAdapter extends BaseAdapter {
     };
   }
 
-  async enumerateMarkers(instance, { expandClusters = true } = {}) {
+  async enumerateMarkers(instance, { expandClusters = true, deepScan = false } = {}) {
     if (instance.kind === "live") {
+      if (deepScan) {
+        await deepScanLeaflet(instance.map);
+      }
       return enumerateFromLiveMap(instance.map, { expandClusters });
     }
     return enumerateFromDOM(instance.el);
@@ -142,6 +145,68 @@ export class LeafletAdapter extends BaseAdapter {
 }
 
 // ---------- internals ----------
+
+// Wait for the map to settle. Leaflet emits a flurry of events; "moveend"
+// and "load" cover both pan and tile-load. Falls back to a timeout.
+function waitLeafletIdle(map, timeoutMs = 1500) {
+  return new Promise((resolve) => {
+    const t = setTimeout(resolve, timeoutMs);
+    const handler = () => { clearTimeout(t); map.off?.("moveend", handler); resolve(); };
+    map.once?.("moveend", handler);
+  });
+}
+
+// Pan+zoom sweep. Fits to known markers (or world bounds), then steps
+// through a 3x3 grid at progressively higher zoom levels so any
+// viewport-bound AJAX loader (very common pattern: the site listens to
+// 'moveend' and fetches markers in the new bounds) gets exercised.
+async function deepScanLeaflet(map) {
+  const L = window.L;
+  if (!L) return;
+
+  const startCenter = map.getCenter?.();
+  const startZoom = map.getZoom?.();
+
+  // Try to fit world or known marker bounds.
+  let bounds = null;
+  const known = enumerateFromLiveMap(map, { expandClusters: true });
+  if (known.length >= 2) {
+    bounds = L.latLngBounds(known.map(m => [m.lat, m.lng])).pad(0.2);
+  } else {
+    bounds = L.latLngBounds([[-55, -170], [60, 170]]);
+  }
+
+  try {
+    map.fitBounds(bounds, { animate: false });
+    await waitLeafletIdle(map);
+  } catch (_) { /* ignore */ }
+
+  const south = bounds.getSouth();
+  const west  = bounds.getWest();
+  const north = bounds.getNorth();
+  const east  = bounds.getEast();
+  const fitZoom = map.getZoom?.() ?? 4;
+
+  const grid = 3;
+  for (let i = 0; i < grid; i++) {
+    for (let j = 0; j < grid; j++) {
+      const lat = south + ((north - south) / grid) * (i + 0.5);
+      const lng = west  + ((east  - west)  / grid) * (j + 0.5);
+      try {
+        map.setView([lat, lng], Math.max(fitZoom + 1, 6), { animate: false });
+        await waitLeafletIdle(map);
+      } catch (_) { /* ignore */ }
+    }
+  }
+
+  // Restore.
+  try {
+    if (startCenter && typeof startZoom === "number") {
+      map.setView(startCenter, startZoom, { animate: false });
+      await waitLeafletIdle(map, 800);
+    }
+  } catch (_) { /* ignore */ }
+}
 
 function enumerateFromLiveMap(map, { expandClusters }) {
   const results = [];
