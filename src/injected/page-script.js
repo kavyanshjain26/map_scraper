@@ -3,7 +3,7 @@
 // <script type="module" src="..."> to the page.
 
 import { installAllHooks, detectAll } from "./detector.js";
-import { extractMarkersFromJsonText, findMarkerArray } from "../shared/network-fetch.js";
+import { extractMarkersFromJsonText, findMarkerArray, asCoords, validLatLng } from "../shared/network-fetch.js";
 
 const TO_PAGE = "MMS_TO_PAGE";
 const FROM_PAGE = "MMS_FROM_PAGE";
@@ -86,7 +86,7 @@ async function handle(cmd, payload) {
     }
 
     case "FIND_DATA_SOURCES": {
-      return findWindowDataSources(payload?.limit || 500);
+      return findPageDataSources(payload?.limit || 5000);
     }
 
     default:
@@ -94,35 +94,118 @@ async function handle(cmd, payload) {
   }
 }
 
-function findWindowDataSources(limit = 500) {
+// Best-effort hunt for marker data already on the page. Designed to work
+// without any user interaction: by the time the user opens the side panel
+// most store-locator pages have hydrated their state into one of a small
+// number of well-known places, and we want to find it before falling back
+// to clicks or network replays.
+//
+// Scan order, fast-path first:
+//   1. Well-known globals  (window.__NEXT_DATA__, __NUXT__, etc.)
+//   2. JSON-LD <script type="application/ld+json">
+//   3. Inline JSON scripts (Next.js, Apollo, Inertia, Algolia, generic)
+//   4. data-* attributes containing JSON (Inertia data-page, livewire, etc.)
+//   5. Cached fetch/XHR responses captured by our network hook
+//   6. Generic window.* sweep (one level deep)
+//
+// Every step is bounded by a wall-clock budget so we never hang the page.
+function findPageDataSources(limit = 5000) {
+  const deadline = Date.now() + 1500;     // 1.5 s total budget
   const sources = [];
   const seen = new WeakSet();
-  const skip = new Set([
-    "window",
-    "self",
-    "top",
-    "parent",
-    "frames",
-    "document",
-    "location",
-    "navigator",
-    "history",
-    "localStorage",
-    "sessionStorage",
-  ]);
+  const recordSource = (source, markers) => {
+    if (!markers || markers.length === 0) return;
+    sources.push({ source, count: markers.length, markers });
+  };
 
-  for (const key of Object.getOwnPropertyNames(window)) {
-    if (skip.has(key) || key.startsWith("__MMS_")) continue;
+  // --- 1. Well-known globals (fast path) ---
+  for (const key of WELL_KNOWN_GLOBALS) {
+    if (Date.now() > deadline) break;
     let value;
     try { value = window[key]; } catch (_) { continue; }
-    const markers = scanDataValue(value, seen);
-    if (markers.length > 0) {
-      sources.push({ source: `window.${key}`, count: markers.length, markers: markers.slice(0, limit) });
+    if (!value || typeof value !== "object") continue;
+    if (seen.has(value)) continue;
+    seen.add(value);
+    try {
+      const markers = findMarkerArray(value);
+      if (markers.length > 0) recordSource(`window.${key}`, markers.slice(0, limit));
+    } catch (_) {}
+  }
+
+  // --- 2. JSON-LD scripts (LocalBusiness / Place / ItemListElement) ---
+  if (Date.now() < deadline) {
+    const jsonLdMarkers = scanJsonLd();
+    if (jsonLdMarkers.length > 0) recordSource("script[type='application/ld+json']", jsonLdMarkers.slice(0, limit));
+  }
+
+  // --- 3. Inline JSON scripts ---
+  if (Date.now() < deadline) {
+    for (const script of document.querySelectorAll(
+      'script[type="application/json"], script#__NEXT_DATA__, script#__NUXT__, script#__INITIAL_STATE__'
+    )) {
+      if (Date.now() > deadline) break;
+      const text = script.textContent || "";
+      if (!text || text.length > 4_000_000) continue;
+      let parsed;
+      try { parsed = JSON.parse(text); } catch (_) { continue; }
+      try {
+        const markers = findMarkerArray(parsed);
+        if (markers.length > 0) {
+          const id = script.id ? `#${script.id}` : `[type='${script.getAttribute("type") || ""}']`;
+          recordSource(`script${id}`, markers.slice(0, limit));
+        }
+      } catch (_) {}
     }
   }
 
-  for (const cached of findCachedResponseSources(limit)) sources.push(cached);
+  // --- 4. data-* attributes carrying JSON (Inertia, livewire, etc.) ---
+  if (Date.now() < deadline) {
+    for (const el of document.querySelectorAll("[data-page], [data-locations], [data-stores], [data-markers], [data-map-data]")) {
+      if (Date.now() > deadline) break;
+      for (const attr of el.attributes) {
+        if (!/^data-/.test(attr.name)) continue;
+        const raw = attr.value;
+        if (!raw || raw.length < 8 || raw[0] !== "{" && raw[0] !== "[") continue;
+        let parsed;
+        try { parsed = JSON.parse(raw); } catch (_) { continue; }
+        try {
+          const markers = findMarkerArray(parsed);
+          if (markers.length > 0) recordSource(`[${attr.name}]`, markers.slice(0, limit));
+        } catch (_) {}
+      }
+    }
+  }
 
+  // --- 5. Cached fetch/XHR responses captured by our network hook ---
+  if (Date.now() < deadline) {
+    for (const cached of findCachedResponseSources(limit)) sources.push(cached);
+  }
+
+  // --- 6. Generic window.* sweep ---
+  if (Date.now() < deadline) {
+    const skip = new Set([
+      "window", "self", "top", "parent", "frames",
+      "document", "location", "navigator", "history",
+      "localStorage", "sessionStorage", "console", "performance",
+      "chrome", "browser", "crypto", "indexedDB", "caches",
+    ]);
+    for (const key of Object.getOwnPropertyNames(window)) {
+      if (Date.now() > deadline) break;
+      if (skip.has(key) || key.startsWith("__MMS_") || WELL_KNOWN_GLOBALS.includes(key)) continue;
+      let value;
+      try { value = window[key]; } catch (_) { continue; }
+      if (!value || typeof value !== "object") continue;
+      if (seen.has(value)) continue;
+      seen.add(value);
+      try {
+        const markers = findMarkerArray(value);
+        if (markers.length > 0) recordSource(`window.${key}`, markers.slice(0, limit));
+      } catch (_) {}
+    }
+  }
+
+  // Pick the largest single source as the primary answer, but expose every
+  // candidate so the side panel can show a list when results are split.
   sources.sort((a, b) => b.count - a.count);
   return {
     count: sources[0]?.count || 0,
@@ -130,6 +213,101 @@ function findWindowDataSources(limit = 500) {
     markers: sources[0]?.markers || [],
     sources: sources.map(({ source, count }) => ({ source, count })),
   };
+}
+
+// Globals checked first because, on most modern frameworks, they always
+// hold the page state if it exists at all. Order is best-bet first.
+const WELL_KNOWN_GLOBALS = [
+  "__NEXT_DATA__",
+  "__NUXT__",
+  "__APOLLO_STATE__",
+  "__INITIAL_STATE__",
+  "__PRELOADED_STATE__",
+  "__INITIAL_DATA__",
+  "__REDUX_STATE__",
+  "__REACT_QUERY_STATE__",
+  "__INERTIA__",
+  "__SVELTE__",
+  "INITIAL_STATE",
+  "INITIAL_DATA",
+  "PAGE_DATA",
+  "pageData",
+  "appData",
+  "siteData",
+  "locations",
+  "stores",
+  "markers",
+  "places",
+  "branches",
+  "dealers",
+];
+
+// JSON-LD: walk every <script type="application/ld+json"> looking for
+// schema.org Place / LocalBusiness / ItemListElement entries. These are
+// rich structured data — name, address, phone, geo all in one shot.
+function scanJsonLd() {
+  const out = [];
+  const seenKeys = new Set();
+  for (const script of document.querySelectorAll('script[type="application/ld+json"]')) {
+    const text = script.textContent || "";
+    if (!text) continue;
+    let parsed;
+    try { parsed = JSON.parse(text); } catch (_) { continue; }
+    extractJsonLdEntities(parsed, (entity) => {
+      const lat = Number(entity.geo?.latitude ?? entity.geo?.lat);
+      const lng = Number(entity.geo?.longitude ?? entity.geo?.lng ?? entity.geo?.lon);
+      if (!validLatLng(lat, lng)) return;
+      const key = `${lat.toFixed(5)},${lng.toFixed(5)}`;
+      if (seenKeys.has(key)) return;
+      seenKeys.add(key);
+      out.push({
+        lat, lng,
+        name: typeof entity.name === "string" ? entity.name : "",
+        address: jsonLdAddress(entity.address),
+        phone: typeof entity.telephone === "string" ? entity.telephone : "",
+        url: typeof entity.url === "string" ? entity.url : "",
+      });
+    });
+  }
+  return out;
+}
+
+function extractJsonLdEntities(node, push) {
+  if (!node) return;
+  if (Array.isArray(node)) { for (const x of node) extractJsonLdEntities(x, push); return; }
+  if (typeof node !== "object") return;
+
+  const type = node["@type"];
+  const types = Array.isArray(type) ? type : [type];
+  const isPlace = types.some((t) =>
+    typeof t === "string" &&
+    /Place|LocalBusiness|Restaurant|Store|Hotel|Hospital|Pharmacy|MedicalClinic|Dentist|AutoDealer|Bank|Library|Museum|TouristAttraction|Park|GasStation|FoodEstablishment/i.test(t)
+  );
+  if (isPlace && node.geo) push(node);
+
+  if (node["@graph"]) extractJsonLdEntities(node["@graph"], push);
+  if (node.itemListElement) extractJsonLdEntities(node.itemListElement, push);
+  if (node.item) extractJsonLdEntities(node.item, push);
+  // Generic recurse — some publishers nest businesses arbitrarily.
+  for (const value of Object.values(node)) {
+    if (value && typeof value === "object" && value !== node["@graph"] && value !== node.itemListElement) {
+      extractJsonLdEntities(value, push);
+    }
+  }
+}
+
+function jsonLdAddress(addr) {
+  if (!addr) return "";
+  if (typeof addr === "string") return addr;
+  if (typeof addr !== "object") return "";
+  const parts = [
+    addr.streetAddress,
+    addr.addressLocality,
+    addr.addressRegion,
+    addr.postalCode,
+    addr.addressCountry,
+  ].map((part) => (typeof part === "string" ? part : (part?.name || "")));
+  return parts.filter(Boolean).join(", ");
 }
 
 function installNetworkResponseCacheHook() {
@@ -217,29 +395,6 @@ function findCachedResponseSources(limit) {
   return out;
 }
 
-function scanDataValue(value, seen, depth = 0) {
-  if (!value || depth > 4) return [];
-  if (typeof value !== "object") return [];
-  if (seen.has(value)) return [];
-  seen.add(value);
-
-  const direct = findMarkerArray(value);
-  if (direct.length > 0) return direct;
-
-  let best = [];
-  let entries;
-  try {
-    entries = Array.isArray(value) ? value.entries() : Object.entries(value);
-  } catch (_) {
-    return [];
-  }
-  for (const [, child] of entries) {
-    const markers = scanDataValue(child, seen, depth + 1);
-    if (markers.length > best.length) best = markers;
-  }
-  return best;
-}
-
 function isLikelyJsonResponse(url, contentType, text) {
   if (isLikelyJsonUrl(url) || /json|geojson/i.test(contentType || "")) return true;
   const trimmed = String(text || "").trim();
@@ -247,7 +402,12 @@ function isLikelyJsonResponse(url, contentType, text) {
 }
 
 function isLikelyJsonUrl(url) {
-  return /\.json(?:\b|$|\?)/i.test(String(url || "")) || /\/api\/|geojson|location|locations|stores|markers/i.test(String(url || ""));
+  const u = String(url || "");
+  if (/\.json(?:\b|$|\?)/i.test(u)) return true;
+  if (/format=json|type=json|f=json|output=json/i.test(u)) return true;
+  // Endpoint path keywords associated with locator data — wide net but
+  // gated by content-type at the call site so false positives are cheap.
+  return /\/api\/|\/graphql|\/gql\b|geojson|location|locations|stores|markers|pin|pins|branches|dealers|outlets|places|locator|find-?a|near-?me|search|nearby|providers|facilities|clinics|pharmacies/i.test(u);
 }
 
 function requestUrl(input) {

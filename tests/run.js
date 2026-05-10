@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 
 import { escapeHtml } from "../src/shared/html.js";
 import { applySchemaFields, selectFirstText } from "../src/shared/schema-selectors.js";
-import { extractMarkersFromJsonText, findMarkerArray, pickBestMarkerEndpoint } from "../src/shared/network-fetch.js";
+import { extractMarkersFromJsonText, findMarkerArray, pickBestMarkerEndpoint, asCoords, validLatLng, parseCoordString } from "../src/shared/network-fetch.js";
 import { toCSV } from "../src/shared/export.js";
 import { chooseDetectedLibrary, shouldTryListFirst } from "../src/sidepanel/strategy.js";
 import { choosePopupCandidate, deriveMarkerSelector, scoreMarkerElement } from "../src/content/capture-heuristics.js";
@@ -238,6 +238,54 @@ test("choosePopupCandidate favors visible contact-rich mutations over large gene
   ]);
 
   assert.equal(best.path, "body > div.popup");
+});
+
+test("validLatLng rejects placeholders and out-of-range values", () => {
+  assert.equal(validLatLng(0, 0), false);
+  assert.equal(validLatLng(95, 50), false);
+  assert.equal(validLatLng(45, 200), false);
+  assert.equal(validLatLng(NaN, 50), false);
+  assert.equal(validLatLng(12.9, 77.6), true);
+  assert.equal(validLatLng(-90, -180), true);
+});
+
+test("parseCoordString handles 'lat,lng' and infers ordering by range", () => {
+  assert.deepEqual(parseCoordString("12.9, 77.6"), { lat: 12.9, lng: 77.6 });
+  // First value out of latitude range -> ordering must be lng,lat.
+  assert.deepEqual(parseCoordString("100.5, 12.9"), { lat: 12.9, lng: 100.5 });
+  assert.equal(parseCoordString("not a coord"), null);
+  assert.equal(parseCoordString("0, 0"), null);
+});
+
+test("asCoords reads nested position/coords and string-encoded fields", () => {
+  assert.deepEqual(asCoords({ position: { lat: 12.9, lng: 77.6 } }), { lat: 12.9, lng: 77.6 });
+  assert.deepEqual(asCoords({ coordinates: [77.6, 12.9] }),         { lat: 12.9, lng: 77.6 });
+  assert.deepEqual(asCoords({ location: "12.9,77.6" }),             { lat: 12.9, lng: 77.6 });
+  // ESRI-style { attributes, geometry: {x, y} }.
+  assert.deepEqual(
+    asCoords({ attributes: { name: "X" }, geometry: { x: 77.6, y: 12.9 } }),
+    { lat: 12.9, lng: 77.6 },
+  );
+  // Bare GeoJSON Point geometry (not wrapped in a Feature).
+  assert.deepEqual(asCoords({ type: "Point", coordinates: [77.6, 12.9] }), { lat: 12.9, lng: 77.6 });
+});
+
+test("findMarkerArray drops (0,0) placeholders and dedupes across nested arrays", () => {
+  const rows = findMarkerArray({
+    clinics:  [{ lat: 12.9, lng: 77.6, name: "A" }, { lat: 0, lng: 0, name: "BAD" }],
+    hospitals:[{ lat: 12.9, lng: 77.6, name: "A-dup" }, { lat: 13.0, lng: 77.5, name: "B" }],
+  });
+  // (0,0) dropped, and A-dup deduped against A by lat/lng tolerance.
+  assert.equal(rows.length, 2);
+  assert.deepEqual(rows.map(r => r.lat).sort(), [12.9, 13.0]);
+});
+
+test("pickBestMarkerEndpoint falls back to neutral URL when nothing scores positive", () => {
+  const best = pickBestMarkerEndpoint([
+    { url: "https://acme.example.com/data?id=42", type: "xmlhttprequest" },
+  ]);
+  // Generic /data with no positive-keyword wins over returning null.
+  assert.equal(best, "https://acme.example.com/data?id=42");
 });
 
 test("toCSV escapes quotes and newlines", () => {
