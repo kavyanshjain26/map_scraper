@@ -113,17 +113,50 @@ export class GoogleMapsAdapter extends BaseAdapter {
   async detect() {
     const hooked = MAP_INSTANCES.slice();
     const hasGlobal = !!window.google?.maps;
-    if (hooked.length === 0 && !hasGlobal) {
+    const containers = findGoogleContainers();
+
+    if (hooked.length === 0 && !hasGlobal && containers.length === 0) {
       return { confidence: 0, reason: "no google.maps", instances: [] };
     }
     if (hooked.length > 0) {
       return {
-        confidence: 0.9,
+        confidence: 0.95,
         reason: `hooked ${hooked.length} google.maps.Map instance(s)`,
         instances: hooked.map(m => ({ kind: "live", map: m })),
       };
     }
-    return { confidence: 0.3, reason: "google.maps present, hook missed construction", instances: [] };
+
+    // Hook missed construction (extension loaded after the map). Try to
+    // recover the live Map instance by inspecting __gm on .gm-style
+    // ancestors — Google Maps stores its internal state there. If we can
+    // recover even one instance, treat the page as fully detected so the
+    // sidepanel shows "Google Maps" rather than falling back to "generic".
+    const recovered = containers
+      .map(recoverGoogleMapFromContainer)
+      .filter(Boolean);
+
+    if (recovered.length > 0) {
+      // Stash recovered instances so the cluster-aware collector can see them.
+      for (const m of recovered) if (!MAP_INSTANCES.includes(m)) MAP_INSTANCES.push(m);
+      return {
+        confidence: 0.85,
+        reason: `recovered ${recovered.length} Google Maps instance(s) from DOM`,
+        instances: recovered.map(m => ({ kind: "live", map: m })),
+      };
+    }
+
+    if (containers.length > 0) {
+      return {
+        confidence: 0.7,
+        reason: `${containers.length} Google Maps container(s), hook missed construction — reload page for full extraction`,
+        instances: containers.map(el => ({ kind: "dom-only", el })),
+      };
+    }
+    return {
+      confidence: 0.3,
+      reason: "google.maps present, hook missed construction",
+      instances: [],
+    };
   }
 
   async enumerateMarkers(instance, { expandClusters = true, deepScan = false } = {}) {
@@ -179,6 +212,66 @@ export class GoogleMapsAdapter extends BaseAdapter {
 
     return out;
   }
+}
+
+// DOM-side detection helpers. Google Maps always renders a `.gm-style` div
+// inside its container, plus copyright/attribution links. We walk to the
+// nearest ancestor that actually owns the Map instance.
+function findGoogleContainers() {
+  const containers = new Set();
+  for (const styled of document.querySelectorAll(".gm-style")) {
+    // The Map element is typically the direct parent of .gm-style.
+    let el = styled.parentElement;
+    while (el && el !== document.body) {
+      if (el.clientWidth > 100 && el.clientHeight > 100) {
+        containers.add(el);
+        break;
+      }
+      el = el.parentElement;
+    }
+  }
+  return Array.from(containers);
+}
+
+// Try to dig the live google.maps.Map instance out of a container element.
+// Google stores internal state under non-enumerable __gm / __gmimt /
+// __e3_ properties whose exact names change between releases, but the
+// Map instance is the only object on the container with both a getCenter
+// and a getDiv method.
+function recoverGoogleMapFromContainer(container) {
+  if (!container) return null;
+  const seen = new Set();
+  const looksLikeMap = (v) =>
+    v && typeof v === "object" &&
+    typeof v.getCenter === "function" &&
+    typeof v.getDiv === "function" &&
+    typeof v.getBounds === "function";
+
+  const visit = (val, depth) => {
+    if (!val || typeof val !== "object" || depth > 4 || seen.has(val)) return null;
+    seen.add(val);
+    if (looksLikeMap(val)) return val;
+    // Check own keys; many internal structs hold the Map under nested objects.
+    const keys = Object.getOwnPropertyNames(val);
+    for (const k of keys) {
+      let next;
+      try { next = val[k]; } catch (_) { continue; }
+      if (next && typeof next === "object") {
+        const found = visit(next, depth + 1);
+        if (found) return found;
+      }
+    }
+    return null;
+  };
+
+  // Walk the container itself + a few descendants — the Map sometimes
+  // attaches its internal struct on the inner .gm-style instead.
+  const candidates = [container, ...container.querySelectorAll(".gm-style")];
+  for (const el of candidates) {
+    const found = visit(el, 0);
+    if (found) return found;
+  }
+  return null;
 }
 
 // Collect every hooked marker that belongs (now or originally) to this map.

@@ -121,6 +121,54 @@ function collectSelectorCandidates(target) {
     steps++;
   }
 
+  // Map-aware candidates. Real-world map pins are usually <div>/<img>/<button>
+  // elements with no useful class — they live inside a known-shape map
+  // container (.gm-style, .leaflet-container, .mapboxgl-map, .ol-viewport).
+  // Scoping our generic-tag selectors to that container makes them precise
+  // enough to match every pin without the genericness penalty.
+  const mapBox = target.closest?.(".gm-style, .leaflet-container, .mapboxgl-map, .maplibregl-map, .ol-viewport, [role='application']");
+  if (mapBox) {
+    const ctxParts = [];
+    if (mapBox.classList?.length) {
+      const cls = Array.from(mapBox.classList).find(c => /map|gm-style|leaflet|mapbox|maplibre|ol-/i.test(c)) || mapBox.classList[0];
+      if (cls) ctxParts.push(`.${cssEscape(cls)}`);
+    } else {
+      ctxParts.push(mapBox.tagName.toLowerCase());
+    }
+    const ctx = ctxParts.join("");
+
+    // Same-tag siblings of the target. Marker layers usually contain N
+    // similarly-shaped children — counting them gives the true pin count.
+    candidates.add(`${ctx} ${tag}`);
+    if (target.classList?.length) {
+      for (const cls of target.classList) {
+        candidates.add(`${ctx} ${tag}.${cssEscape(cls)}`);
+      }
+    }
+    const ttl = target.getAttribute?.("title");
+    const al  = target.getAttribute?.("aria-label");
+    if (ttl) candidates.add(`${ctx} ${tag}[title]`);
+    if (al)  candidates.add(`${ctx} ${tag}[aria-label]`);
+
+    // Inline-style transform: translate(...) is the canonical signature of
+    // a positioned map marker (Leaflet, Google AdvancedMarker, custom DOM).
+    const inlineStyle = target.getAttribute?.("style") || "";
+    if (/translate/i.test(inlineStyle)) {
+      candidates.add(`${ctx} ${tag}[style*="translate"]`);
+      candidates.add(`${ctx} [style*="translate"]`);
+    }
+
+    // <img> markers — match by sibling pattern (any <img> in the map).
+    if (tag === "img") {
+      candidates.add(`${ctx} img`);
+      const src = target.getAttribute?.("src");
+      if (src && src.length < 200) {
+        const ext = src.match(/\.([a-z0-9]{2,5})(?:\?|$)/i)?.[1];
+        if (ext) candidates.add(`${ctx} img[src$=".${ext}"]`);
+      }
+    }
+  }
+
   return Array.from(candidates);
 }
 

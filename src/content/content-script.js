@@ -173,18 +173,48 @@
   let teachClickHandler = null;
   let teachObserver = null;
 
+  let teachMoveHandler = null;
+  let teachHovered = null;
+
   async function startTeach() {
     if (teachActive) return;
     const heuristics = await heuristicsReady;
     teachActive = true;
     await chrome.runtime.sendMessage({ type: "TEACH_CAPTURE_STARTED" }).catch(() => {});
 
+    // Live preview: as the user hovers, derive the selector for the element
+    // under the cursor and paint a purple outline on EVERY matching element
+    // so they can see what their click will capture before committing.
+    teachMoveHandler = (ev) => {
+      const el = ev.target;
+      if (!el || el === document.body || el === document.documentElement) return;
+      if (teachHovered && teachHovered !== el) {
+        teachHovered.classList.remove("__mms_highlight");
+      }
+      teachHovered = el;
+      el.classList.add("__mms_highlight");
+      const sel = heuristics.deriveMarkerSelector(el);
+      paintMatchHighlights(sel, el);
+    };
+    document.addEventListener("mousemove", teachMoveHandler, true);
+    document.body.classList.add("__mms_picking");
+
     teachClickHandler = (ev) => {
       document.removeEventListener("click", teachClickHandler, true);
+      document.removeEventListener("mousemove", teachMoveHandler, true);
       teachClickHandler = null;
+      teachMoveHandler = null;
       const target = ev.target;
       const markerSelector = heuristics.deriveMarkerSelector(target);
       const markerCount = markerSelector ? document.querySelectorAll(markerSelector).length : 0;
+      // Briefly leave the purple outline on every match so the user sees a
+      // visual confirmation of how many pins this selector covers.
+      paintMatchHighlights(markerSelector, target);
+      pulsePicked(target);
+      setTimeout(() => {
+        clearMatchHighlights();
+        document.body.classList.remove("__mms_picking");
+      }, 1800);
       const clickInfo = {
         tag: target.tagName,
         cls: typeof target.className === "string" ? target.className : "",
@@ -294,10 +324,54 @@
       document.removeEventListener("click", teachClickHandler, true);
       teachClickHandler = null;
     }
+    if (teachMoveHandler) {
+      document.removeEventListener("mousemove", teachMoveHandler, true);
+      teachMoveHandler = null;
+    }
+    if (teachHovered) {
+      teachHovered.classList.remove("__mms_highlight");
+      teachHovered = null;
+    }
     teachObserver?.disconnect();
     teachObserver = null;
     teachActive = false;
     chrome.runtime.sendMessage({ type: "TEACH_CAPTURE_STOPPED" }).catch(() => {});
+  }
+
+  // --- Match-set highlighting ----------------------------------------------
+  // paintMatchHighlights(selector, hovered) tags every node matching `selector`
+  // with the .__mms_match purple outline so the user sees the full set.
+  // Safe to call repeatedly — it only diffs.
+  let _mmsMatchSet = new Set();   // currently-tagged nodes
+  function paintMatchHighlights(selector, hovered) {
+    const next = new Set();
+    if (selector) {
+      let nodes = [];
+      try { nodes = Array.from(document.querySelectorAll(selector)); }
+      catch (_) { /* invalid selector */ }
+      for (const n of nodes) {
+        if (n === hovered) continue;
+        next.add(n);
+      }
+    }
+    // Remove tags from nodes no longer in the match set.
+    for (const n of _mmsMatchSet) {
+      if (!next.has(n)) n.classList.remove("__mms_match");
+    }
+    // Add tag to new matches.
+    for (const n of next) {
+      if (!_mmsMatchSet.has(n)) n.classList.add("__mms_match");
+    }
+    _mmsMatchSet = next;
+  }
+  function clearMatchHighlights() {
+    for (const n of _mmsMatchSet) n.classList.remove("__mms_match");
+    _mmsMatchSet = new Set();
+  }
+  function pulsePicked(el) {
+    if (!el) return;
+    el.classList.add("__mms_picked");
+    setTimeout(() => el.classList.remove("__mms_picked"), 900);
   }
 
   function domPath(el) {
@@ -331,7 +405,7 @@
     if (pickActive) return;
     pickActive = true;
 
-    pickMoveHandler = (ev) => {
+    pickMoveHandler = async (ev) => {
       const el = ev.target;
       if (pickHighlighted && pickHighlighted !== el) {
         pickHighlighted.classList.remove("__mms_highlight");
@@ -339,6 +413,13 @@
       if (el && el !== document.body && el !== document.documentElement) {
         el.classList.add("__mms_highlight");
         pickHighlighted = el;
+        // Preview the full match set so the user sees how many pins their
+        // pick will cover.
+        try {
+          const { deriveMarkerSelector } = await heuristicsReady;
+          const sel = deriveMarkerSelector(el);
+          paintMatchHighlights(sel, el);
+        } catch (_) { /* heuristics module still loading */ }
       }
     };
 
@@ -351,6 +432,11 @@
       const { deriveMarkerSelector } = await heuristicsReady;
       const selector = deriveMarkerSelector(el);
       const count = selector ? document.querySelectorAll(selector).length : 0;
+
+      // Leave the purple match outline up briefly as confirmation.
+      paintMatchHighlights(selector, el);
+      pulsePicked(el);
+      setTimeout(clearMatchHighlights, 1800);
 
       chrome.runtime.sendMessage({
         type: "PICK_COMPLETE",
