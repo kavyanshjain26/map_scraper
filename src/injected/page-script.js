@@ -1,21 +1,11 @@
 // src/injected/page-script.js
 // MAIN-world entry point. Loaded by the content script appending a
-// <script type="module" src="..."> to the page. Because we declared it
-// in web_accessible_resources, the page can load it.
-//
-// Responsibilities:
-//   1. Install library hooks (Leaflet/Mapbox/Google) at document_start.
-//   2. Listen for window.postMessage commands from the content script.
-//   3. Drive the detector + adapters and post results back.
-//
-// This file runs in the PAGE'S JS context — it can see window.L, but it
-// CANNOT see chrome.* APIs. All chrome.* calls happen in the content
-// script, which bridges via window.postMessage.
+// <script type="module" src="..."> to the page.
 
 import { installAllHooks, detectAll } from "./detector.js";
 import { extractMarkersFromJsonText, findMarkerArray } from "../shared/network-fetch.js";
 
-const TO_PAGE   = "MMS_TO_PAGE";
+const TO_PAGE = "MMS_TO_PAGE";
 const FROM_PAGE = "MMS_FROM_PAGE";
 const BRIDGE_TOKEN = new URL(import.meta.url).searchParams.get("token") || "";
 
@@ -44,20 +34,26 @@ async function handle(cmd, payload) {
   switch (cmd) {
     case "DETECT": {
       const results = await detectAll();
-      // Strip non-serializable parts (map/marker objects) before posting.
-      return results.map(r => ({
-        adapter:    r.adapter,
-        confidence: r.confidence,
-        reason:     r.reason,
-        instanceCount: r.instances.length,
-        instances: r.instances.map(serializeDetectInstance),
+      return results.map((result) => ({
+        adapter: result.adapter,
+        confidence: result.confidence,
+        reason: result.reason,
+        instanceCount: result.instances.length,
+        instances: result.instances.map(serializeDetectInstance),
       }));
     }
 
     case "ENUMERATE": {
-      const { adapterName, instanceIndex = 0, expandClusters = true, schemaHint = null, mode = "library" } = payload || {};
+      const {
+        adapterName,
+        instanceIndex = 0,
+        expandClusters = true,
+        deepScan = false,
+        schemaHint = null,
+        mode = "library",
+      } = payload || {};
       const results = await detectAll();
-      const chosen  = results.find(r => r.adapter === adapterName);
+      const chosen = results.find((result) => result.adapter === adapterName);
       if (!chosen) throw new Error(`No detection for ${adapterName}`);
       const instance = chosen.instances[instanceIndex]
         || ((adapterName === "List (cards/rows)" && schemaHint?.listSelector)
@@ -66,11 +62,13 @@ async function handle(cmd, payload) {
       if (!instance) throw new Error(`No instance #${instanceIndex} for ${adapterName}`);
 
       const adapter = new chosen.ctor();
-      const markers = await adapter.enumerateMarkers(instance, { expandClusters, schemaHint, mode });
+      const markers = await adapter.enumerateMarkers(instance, {
+        expandClusters,
+        deepScan,
+        schemaHint,
+        mode,
+      });
 
-      // Emit ~20 progress updates across the run, regardless of total.
-      // Each update ships both the running count AND the newly-extracted
-      // slice of markers so the sidepanel can render a live preview.
       const step = Math.max(1, Math.floor(markers.length / 20));
       const extracted = [];
       let lastSent = 0;
@@ -99,7 +97,19 @@ async function handle(cmd, payload) {
 function findWindowDataSources(limit = 500) {
   const sources = [];
   const seen = new WeakSet();
-  const skip = new Set(["window", "self", "top", "parent", "frames", "document", "location", "navigator", "history", "localStorage", "sessionStorage"]);
+  const skip = new Set([
+    "window",
+    "self",
+    "top",
+    "parent",
+    "frames",
+    "document",
+    "location",
+    "navigator",
+    "history",
+    "localStorage",
+    "sessionStorage",
+  ]);
 
   for (const key of Object.getOwnPropertyNames(window)) {
     if (skip.has(key) || key.startsWith("__MMS_")) continue;
@@ -111,9 +121,7 @@ function findWindowDataSources(limit = 500) {
     }
   }
 
-  for (const cached of findCachedResponseSources(limit)) {
-    sources.push(cached);
-  }
+  for (const cached of findCachedResponseSources(limit)) sources.push(cached);
 
   sources.sort((a, b) => b.count - a.count);
   return {
@@ -209,22 +217,6 @@ function findCachedResponseSources(limit) {
   return out;
 }
 
-function isLikelyJsonResponse(url, contentType, text) {
-  if (isLikelyJsonUrl(url) || /json|geojson/i.test(contentType || "")) return true;
-  const trimmed = String(text || "").trim();
-  return trimmed.startsWith("{") || trimmed.startsWith("[");
-}
-
-function isLikelyJsonUrl(url) {
-  return /\.json(?:\b|$|\?)/i.test(String(url || "")) || /\/api\/|geojson|location|locations|stores|markers/i.test(String(url || ""));
-}
-
-function requestUrl(input) {
-  if (!input) return "";
-  if (typeof input === "string") return input;
-  try { return input.url || String(input); } catch (_) { return ""; }
-}
-
 function scanDataValue(value, seen, depth = 0) {
   if (!value || depth > 4) return [];
   if (typeof value !== "object") return [];
@@ -246,6 +238,22 @@ function scanDataValue(value, seen, depth = 0) {
     if (markers.length > best.length) best = markers;
   }
   return best;
+}
+
+function isLikelyJsonResponse(url, contentType, text) {
+  if (isLikelyJsonUrl(url) || /json|geojson/i.test(contentType || "")) return true;
+  const trimmed = String(text || "").trim();
+  return trimmed.startsWith("{") || trimmed.startsWith("[");
+}
+
+function isLikelyJsonUrl(url) {
+  return /\.json(?:\b|$|\?)/i.test(String(url || "")) || /\/api\/|geojson|location|locations|stores|markers/i.test(String(url || ""));
+}
+
+function requestUrl(input) {
+  if (!input) return "";
+  if (typeof input === "string") return input;
+  try { return input.url || String(input); } catch (_) { return ""; }
 }
 
 function postProgress(body, chunk) {

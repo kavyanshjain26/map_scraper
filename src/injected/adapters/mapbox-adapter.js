@@ -1,7 +1,7 @@
 // src/injected/adapters/mapbox-adapter.js
 // Mapbox GL / MapLibre GL support. The page-world hook captures live map
-// instances, HTML Marker instances, and addLayer calls. Enumeration then reads
-// HTML marker coordinates plus GeoJSON source data directly when available.
+// instances, HTML Marker instances, and addLayer calls. Enumeration reads HTML
+// marker coordinates, GeoJSON source data, and clustered source leaves.
 
 import { BaseAdapter } from "./base-adapter.js";
 import { applySchemaFields } from "../../shared/schema-selectors.js";
@@ -93,25 +93,30 @@ export class MapboxAdapter extends BaseAdapter {
 
   get rendersToCanvas() { return true; }
 
-  async enumerateMarkers(instance, { expandClusters = true, mode = "library" } = {}) {
+  async enumerateMarkers(instance, { expandClusters = true, mode = "library", deepScan = false } = {}) {
     if (instance.kind !== "live") {
       throw new Error("Mapbox DOM-only enumeration not supported - reload with the extension active");
     }
 
     const map = instance.map;
+    if (deepScan) await deepScanMapbox(map);
+
     const out = [];
+    const seen = new Set();
     let id = 0;
+    const push = (lat, lng, raw) => {
+      if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
+      const key = `${lat.toFixed(6)},${lng.toFixed(6)}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      out.push({ id: `mapbox-${id++}`, lat, lng, raw });
+    };
 
     for (const marker of MARKER_INSTANCES) {
       if (marker._map !== map) continue;
       const ll = marker.getLngLat?.();
       if (!ll) continue;
-      out.push({
-        id: `mapbox-html-${id++}`,
-        lat: ll.lat,
-        lng: ll.lng,
-        raw: { kind: "html-marker", marker },
-      });
+      push(ll.lat, ll.lng, { kind: "html-marker", marker });
     }
 
     if (!map.isStyleLoaded?.()) {
@@ -130,22 +135,15 @@ export class MapboxAdapter extends BaseAdapter {
 
       const features = mode === "pan"
         ? await readGeoJsonFeaturesAcrossPanGrid(map, sourceId, source, sourceDef, { expandClusters })
-        : await readGeoJsonFeatures(map, sourceId, source, sourceDef, {
-          expandClusters,
-          queryTiles: true,
-        });
+        : await readGeoJsonFeatures(map, sourceId, source, sourceDef, { expandClusters, queryTiles: true });
+
       for (const feature of features) {
         const point = featureToPoint(feature);
         if (!point) continue;
-        out.push({
-          id: `mapbox-geojson-${sourceId}-${id++}`,
-          lat: point.lat,
-          lng: point.lng,
-          raw: {
-            kind: "geojson-feature",
-            sourceId,
-            properties: feature.properties || {},
-          },
+        push(point.lat, point.lng, {
+          kind: "geojson-feature",
+          sourceId,
+          properties: feature.properties || {},
         });
       }
     }
@@ -201,6 +199,10 @@ async function readGeoJsonFeatures(map, sourceId, source, sourceDef, { expandClu
     }
   }
 
+  if (sourceDef?.cluster && expandClusters && typeof source.getClusterLeaves === "function") {
+    out.push(...await collectMapboxClusterLeaves(map, source, sourceId));
+  }
+
   if (data?.type === "FeatureCollection" && Array.isArray(data.features)) {
     for (const feature of data.features) {
       if (!feature?.properties?.cluster) out.push(feature);
@@ -224,7 +226,7 @@ async function readGeoJsonFeatures(map, sourceId, source, sourceDef, { expandClu
 
   for (const feature of queried) {
     if (feature?.properties?.cluster && expandClusters && typeof source.getClusterLeaves === "function") {
-      const leaves = await getClusterLeaves(source, feature.properties.cluster_id);
+      const leaves = await getClusterLeavesPaged(source, feature.properties.cluster_id, feature.properties.point_count);
       out.push(...leaves);
     } else if (!feature?.properties?.cluster) {
       out.push(feature);
@@ -233,7 +235,46 @@ async function readGeoJsonFeatures(map, sourceId, source, sourceDef, { expandClu
   return out;
 }
 
-function getClusterLeaves(source, clusterId) {
+async function collectMapboxClusterLeaves(map, source, sourceId) {
+  const out = [];
+  const layers = (map.getStyle?.()?.layers || []).filter((layer) => layer.source === sourceId);
+  if (!layers.length) return out;
+
+  const seenIds = new Set();
+  const clusters = [];
+  for (const layer of layers) {
+    let features = [];
+    const options = layer["source-layer"] ? { sourceLayer: layer["source-layer"] } : undefined;
+    try { features = map.querySourceFeatures?.(sourceId, options) || []; } catch (_) { continue; }
+    for (const feature of features) {
+      const clusterId = feature.properties?.cluster_id;
+      if (clusterId == null || seenIds.has(clusterId)) continue;
+      seenIds.add(clusterId);
+      clusters.push({ id: clusterId, count: feature.properties.point_count || 1000 });
+    }
+  }
+
+  for (const cluster of clusters) {
+    out.push(...await getClusterLeavesPaged(source, cluster.id, cluster.count));
+  }
+  return out;
+}
+
+async function getClusterLeavesPaged(source, clusterId, total = 50000) {
+  const out = [];
+  let offset = 0;
+  const limit = 500;
+  while (offset < total) {
+    const leaves = await getClusterLeaves(source, clusterId, limit, offset);
+    if (leaves.length === 0) break;
+    out.push(...leaves);
+    offset += leaves.length;
+    if (leaves.length < limit) break;
+  }
+  return out;
+}
+
+function getClusterLeaves(source, clusterId, limit, offset) {
   return new Promise((resolve) => {
     let settled = false;
     const finish = (items) => {
@@ -243,7 +284,7 @@ function getClusterLeaves(source, clusterId) {
     };
 
     try {
-      const maybePromise = source.getClusterLeaves(clusterId, 50000, 0, (err, leaves) => {
+      const maybePromise = source.getClusterLeaves(clusterId, limit, offset, (err, leaves) => {
         if (err) finish([]);
         else finish(leaves);
       });
@@ -349,6 +390,28 @@ function panGridCenters(map) {
     }
   }
   return centers;
+}
+
+async function deepScanMapbox(map) {
+  const original = readMapView(map);
+  try {
+    map.fitBounds?.([[-170, -55], [170, 60]], { animate: false, duration: 0 });
+    await waitForMapIdle(map, 2000);
+  } catch (_) {}
+
+  for (let row = 0; row < 3; row++) {
+    for (let col = 0; col < 3; col++) {
+      const lat = -55 + (115 / 3) * (row + 0.5);
+      const lng = -170 + (340 / 3) * (col + 0.5);
+      moveMap(map, [lng, lat], 5);
+      await waitForMapIdle(map, 2000);
+    }
+  }
+
+  if (original) {
+    moveMap(map, original.center, original.zoom);
+    await waitForMapIdle(map, 800);
+  }
 }
 
 function waitForMapIdle(map, timeoutMs) {
